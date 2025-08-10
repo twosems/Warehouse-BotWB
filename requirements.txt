@@ -1,0 +1,6 @@
+aiogram==3.13.1
+sqlalchemy==2.0.35
+asyncpg==0.30.0
+python-dotenv==1.0.1
+bcrypt==4.2.0
+greenlet==3.2.3

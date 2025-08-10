@@ -1,0 +1,43 @@
+2025-08-09 21:48:39,511 - aiogram.dispatcher - INFO - Start polling
+2025-08-09 21:48:40,293 - aiogram.dispatcher - INFO - Run polling for bot @WHMalina_bot id=8497384007 - 'MALINA warehause Bot'
+2025-08-09 21:49:06,052 - aiogram.event - INFO - Update id=741601438 is handled. Duration 1672 ms by bot id=8497384007
+2025-08-09 21:49:17,001 - aiogram.event - INFO - Update id=741601439 is handled. Duration 725 ms by bot id=8497384007
+2025-08-09 21:49:21,702 - aiogram.event - INFO - Update id=741601440 is handled. Duration 706 ms by bot id=8497384007
+2025-08-09 21:49:24,195 - aiogram.event - INFO - Update id=741601441 is handled. Duration 1065 ms by bot id=8497384007
+2025-08-09 21:49:26,342 - aiogram.event - INFO - Update id=741601442 is handled. Duration 598 ms by bot id=8497384007
+2025-08-09 21:49:28,745 - aiogram.event - INFO - Update id=741601443 is handled. Duration 772 ms by bot id=8497384007
+2025-08-09 21:49:41,913 - aiogram.event - INFO - Update id=741601444 is handled. Duration 681 ms by bot id=8497384007
+2025-08-09 21:49:48,665 - aiogram.dispatcher - INFO - Polling stopped
+2025-08-09 21:49:48,918 - aiogram.dispatcher - INFO - Polling stopped for bot @WHMalina_bot id=8497384007 - 'MALINA warehause Bot'
+2025-08-09 21:49:54,775 - aiogram.dispatcher - INFO - Start polling
+2025-08-09 21:49:56,034 - aiogram.dispatcher - INFO - Run polling for bot @WHMalina_bot id=8497384007 - 'MALINA warehause Bot'
+2025-08-09 21:50:00,536 - aiogram.event - INFO - Update id=741601445 is handled. Duration 2297 ms by bot id=8497384007
+2025-08-09 21:50:03,771 - aiogram.event - INFO - Update id=741601446 is handled. Duration 767 ms by bot id=8497384007
+2025-08-09 21:52:48,805 - aiogram.dispatcher - INFO - Polling stopped
+2025-08-09 21:52:49,066 - aiogram.dispatcher - INFO - Polling stopped for bot @WHMalina_bot id=8497384007 - 'MALINA warehause Bot'
+2025-08-09 21:52:56,306 - aiogram.dispatcher - INFO - Start polling
+2025-08-09 21:52:57,138 - aiogram.dispatcher - INFO - Run polling for bot @WHMalina_bot id=8497384007 - 'MALINA warehause Bot'
+2025-08-09 21:52:58,391 - aiogram.event - INFO - Update id=741601447 is handled. Duration 1115 ms by bot id=8497384007
+2025-08-09 21:53:00,372 - aiogram.event - INFO - Update id=741601448 is handled. Duration 292 ms by bot id=8497384007
+2025-08-09 21:53:02,321 - aiogram.event - INFO - Update id=741601449 is handled. Duration 281 ms by bot id=8497384007
+2025-08-09 21:59:10,196 - aiogram.dispatcher - INFO - Polling stopped
+2025-08-09 21:59:10,460 - aiogram.dispatcher - INFO - Polling stopped for bot @WHMalina_bot id=8497384007 - 'MALINA warehause Bot'
+2025-08-09 22:04:01,115 - aiogram.dispatcher - INFO - Start polling
+2025-08-09 22:04:04,181 - aiogram.dispatcher - INFO - Run polling for bot @WHMalina_bot id=8497384007 - 'MALINA warehause Bot'
+2025-08-09 22:04:05,482 - aiogram.event - INFO - Update id=741601450 is handled. Duration 796 ms by bot id=8497384007
+2025-08-09 22:04:08,505 - aiogram.event - INFO - Update id=741601451 is handled. Duration 843 ms by bot id=8497384007
+2025-08-09 22:04:15,775 - aiogram.event - INFO - Update id=741601452 is handled. Duration 694 ms by bot id=8497384007
+2025-08-09 22:05:07,409 - aiogram.event - INFO - Update id=741601453 is handled. Duration 1898 ms by bot id=8497384007
+2025-08-09 22:05:16,376 - aiogram.event - INFO - Update id=741601454 is handled. Duration 411 ms by bot id=8497384007
+2025-08-09 22:05:19,022 - aiogram.event - INFO - Update id=741601455 is handled. Duration 179 ms by bot id=8497384007
+2025-08-09 22:05:24,366 - aiogram.event - INFO - Update id=741601456 is handled. Duration 829 ms by bot id=8497384007
+2025-08-09 22:05:26,544 - aiogram.event - INFO - Update id=741601457 is handled. Duration 507 ms by bot id=8497384007
+2025-08-09 22:05:28,654 - aiogram.event - INFO - Update id=741601458 is handled. Duration 816 ms by bot id=8497384007
+2025-08-09 22:05:30,347 - aiogram.event - INFO - Update id=741601459 is handled. Duration 914 ms by bot id=8497384007
+2025-08-09 22:05:31,380 - aiogram.event - INFO - Update id=741601460 is handled. Duration 400 ms by bot id=8497384007
+2025-08-09 22:05:33,976 - aiogram.event - INFO - Update id=741601461 is handled. Duration 814 ms by bot id=8497384007
+2025-08-09 22:05:36,440 - aiogram.event - INFO - Update id=741601462 is handled. Duration 422 ms by bot id=8497384007
+2025-08-09 22:05:39,550 - aiogram.event - INFO - Update id=741601463 is handled. Duration 347 ms by bot id=8497384007
+2025-08-09 22:05:43,691 - aiogram.event - INFO - Update id=741601464 is handled. Duration 1210 ms by bot id=8497384007
+2025-08-09 22:17:57,735 - aiogram.dispatcher - INFO - Polling stopped
+2025-08-09 22:17:57,995 - aiogram.dispatcher - INFO - Polling stopped for bot @WHMalina_bot id=8497384007 - 'MALINA warehause Bot'
