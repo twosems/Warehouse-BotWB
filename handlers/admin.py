@@ -7,7 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 from sqlalchemy import select, func, update
 from sqlalchemy.exc import IntegrityError
 
-from database.db import get_session, ensure_core_data
+from database.db import get_session
 from database.models import (
     User, UserRole,
     Warehouse, Product,
@@ -200,6 +200,7 @@ async def admin_send_message(cb: types.CallbackQuery, user: User, state: FSMCont
 async def admin_enter_message(cb: types.CallbackQuery, user: User, state: FSMContext):
     if user.role != UserRole.admin:
         await cb.answer("Доступ запрещен.", show_alert=True); return
+    await cb.answer()
     try:
         _, user_id_str = cb.data.split(":"); user_id = int(user_id_str)
     except Exception:
@@ -228,7 +229,6 @@ async def admin_wh_root(cb: types.CallbackQuery, user: User, state: FSMContext):
     if user.role != UserRole.admin:
         await cb.answer("Доступ запрещен.", show_alert=True); return
     await cb.answer()
-    await ensure_core_data()
     await send_content(cb, "Склады: выберите действие", reply_markup=kb_admin_wh_root())
 
 async def admin_wh_list(cb: types.CallbackQuery, user: User):
