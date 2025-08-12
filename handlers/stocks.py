@@ -70,7 +70,8 @@ async def stocks_view(cb: types.CallbackQuery, user: User, state: FSMContext):
         return
 
     await send_content(cb, "🏬 Выберите склад для просмотра остатков:",
-                       reply_markup=warehouses_kb(warehouses))
+                       reply_markup=warehouses_kb(warehouses, prefix="pr_wh"))
+#                      reply_markup=warehouses_kb(warehouses))
 
 
 # ===== Выбор склада для просмотра -> меню типа отчета =====

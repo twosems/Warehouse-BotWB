@@ -71,7 +71,11 @@ async def view_docs(cb: types.CallbackQuery, user: User, state: FSMContext, page
     rows = []
     for doc in docs:
         date_str = doc.date.strftime('%Y-%m-%d %H:%M')
-        rows.append([types.InlineKeyboardButton(text=f"Документ №{doc.doc_id} от {date_str}", callback_data=f"view_doc:{doc.doc_id}")])
+ #       rows.append([types.InlineKeyboardButton(text=f"Документ №{doc.doc_id} от {date_str}", callback_data=f"view_doc:{doc.doc_id}")])
+        rows.append([types.InlineKeyboardButton(
+            text=f"Документ №{doc.doc_id} от {date_str}",
+            callback_data=f"view_doc:{doc.doc_id}"
+        )])
 
     pag_row = build_pagination_keyboard(
         page=page,

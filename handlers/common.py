@@ -43,14 +43,14 @@ class RoleCheckMiddleware(BaseMiddleware):
 
         return await handler(event, data)
 
-async def send_content(cb: types.CallbackQuery, text: str, reply_markup=None):
+async def send_content(cb: types.CallbackQuery, text: str, reply_markup=None, parse_mode=None):
     """Удаляем прошлый контент и отправляем новый текст отдельным сообщением — ниже клавиатуры."""
     uid = cb.from_user.id
     mid = last_content_msg.get(uid)
     if mid:
         with contextlib.suppress(Exception):
             await cb.bot.delete_message(chat_id=cb.message.chat.id, message_id=mid)
-    m = await cb.message.answer(text, reply_markup=reply_markup)
+    m = await cb.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
     last_content_msg[uid] = m.message_id
 
 # ===== /start: заявка админу или меню =====

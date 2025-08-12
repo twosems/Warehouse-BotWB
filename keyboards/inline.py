@@ -14,7 +14,7 @@ def confirm_kb(prefix: str = "rcv") -> InlineKeyboardMarkup:
     ])
 
 
-def warehouses_kb(warehouses: List[Warehouse]) -> InlineKeyboardMarkup:
+def warehouses_kb(warehouses: List[Warehouse], prefix: str = "rcv_wh") -> InlineKeyboardMarkup:
     """
     Список складов (СПб и Томск — первыми), плюс кнопка назад.
     callback_data: rcv_wh:{id}  # Уникальный префикс для receiving
@@ -25,7 +25,8 @@ def warehouses_kb(warehouses: List[Warehouse]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     for w in warehouses_sorted:
         label = ("🏙️ " if w.name == "Санкт-Петербург" else "🏔️ " if w.name == "Томск" else "") + w.name
-        rows.append([InlineKeyboardButton(text=label, callback_data=f"rcv_wh:{w.id}")])
+  #     rows.append([InlineKeyboardButton(text=label, callback_data=f"rcv_wh:{w.id}")])
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"{prefix}:{w.id}")])
 
     rows.append([InlineKeyboardButton(text="⬅️ Назад к меню", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
