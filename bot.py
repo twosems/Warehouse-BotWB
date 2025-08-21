@@ -6,12 +6,12 @@ from aiogram import Bot, Dispatcher
 from config import BOT_TOKEN
 from handlers.common import RoleCheckMiddleware, register_common_handlers
 from database.db import init_db
-
+from handlers.manager import router as manager_router
 from handlers.admin import register_admin_handlers
 from handlers.stocks import register_stocks_handlers
 from handlers.receiving import register_receiving_handlers
 from handlers.supplies import register_supplies_handlers
-from handlers.packing import register_packing_handlers
+from handlers.packing import router as packing_router
 from handlers.reports import register_reports_handlers
 
 logging.basicConfig(level=logging.INFO)
@@ -32,7 +32,9 @@ async def main():
     register_receiving_handlers(dp)
     register_stocks_handlers(dp)
     register_supplies_handlers(dp)
-    register_packing_handlers(dp)
+    dp.include_router(packing_router)
+    dp.include_router(manager_router)
+    # register_packing_handlers(dp)
     register_reports_handlers(dp)
     register_common_handlers(dp)  # общий — ПОСЛЕДНИМ
 

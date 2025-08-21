@@ -3,6 +3,8 @@ from aiogram import Dispatcher, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from sqlalchemy import select, func, desc
+from database.models import ProductStage
+from html import escape as h  # для безопасной разметки HTML
 
 from database.db import get_session
 from database.models import User, Warehouse, Product, StockMovement, MovementType
@@ -50,8 +52,9 @@ async def view_docs(cb: types.CallbackQuery, user: User, state: FSMContext, page
     await state.set_state(ReceivingViewState.viewing_docs)
 
     async with get_session() as session:
-        # Получаем уникальные документы для prihod
-        total_stmt = select(func.count(func.distinct(StockMovement.doc_id))).where(StockMovement.type == MovementType.prihod)
+        total_stmt = select(func.count(func.distinct(StockMovement.doc_id))).where(
+            StockMovement.type == MovementType.prihod
+        )
         total = await session.scalar(total_stmt)
 
         res = await session.execute(
@@ -65,16 +68,22 @@ async def view_docs(cb: types.CallbackQuery, user: User, state: FSMContext, page
         docs = res.all()
 
     if not docs:
-        await send_content(cb, "Документов по поступлению нет.", reply_markup=kb_receiving_root())
+        await send_content(
+            cb,
+            "📭 Документов по поступлению пока нет.",
+            reply_markup=types.InlineKeyboardMarkup(
+                inline_keyboard=[[types.InlineKeyboardButton(text="⬅️ Назад", callback_data="receiving")]]
+            ),
+        )
         return
 
     rows = []
-    for doc in docs:
-        date_str = doc.date.strftime('%Y-%m-%d %H:%M')
- #       rows.append([types.InlineKeyboardButton(text=f"Документ №{doc.doc_id} от {date_str}", callback_data=f"view_doc:{doc.doc_id}")])
+    for row in docs:
+        doc_id = row.doc_id
+        date_str = row.date.strftime("%Y-%m-%d %H:%M")
         rows.append([types.InlineKeyboardButton(
-            text=f"Документ №{doc.doc_id} от {date_str}",
-            callback_data=f"view_doc:{doc.doc_id}"
+            text=f"Документ №{doc_id} от {date_str}",
+            callback_data=f"view_doc:{doc_id}"
         )])
 
     pag_row = build_pagination_keyboard(
@@ -122,6 +131,7 @@ async def view_doc(cb: types.CallbackQuery, user: User, state: FSMContext):
             .join(Product, Product.id == StockMovement.product_id)
             .join(User, User.id == StockMovement.user_id)
             .where(StockMovement.doc_id == doc_id, StockMovement.type == MovementType.prihod)
+            .order_by(StockMovement.id)
         )
         movements = res.all()
 
@@ -129,21 +139,34 @@ async def view_doc(cb: types.CallbackQuery, user: User, state: FSMContext):
         await send_content(cb, "Документ не найден.")
         return
 
-    # Предполагаем, что документ может иметь несколько строк (товаров)
-    text = f"📑 **Документ №{doc_id} от {movements[0].StockMovement.date.strftime('%Y-%m-%d %H:%M:%S')}**\n\n"
+    first_mv: StockMovement = movements[0][0]
+    header = f"📑 <b>Документ №{h(str(doc_id))} от {h(first_mv.date.strftime('%Y-%m-%d %H:%M:%S'))}</b>\n\n"
+
+    parts = [header]
     for mv, wh, prod, usr in movements:
-        text += (
-            f"🏬 Склад: *{wh.name}*\n"
-            f"📦 Товар: *{prod.name}* (арт. {prod.article})\n"
-            f"➡️ Количество: *{mv.qty}* шт.\n"
-            f"💬 Комментарий: {mv.comment or '—'}\n"
-            f"👤 Создал: *{usr.name}*\n\n"
+        parts.append(
+            "🏬 Склад: <b>{wh}</b>\n"
+            "📦 Товар: <b>{prod}</b> (арт. <code>{art}</code>)\n"
+            "➡️ Количество: <b>{qty}</b> шт.\n"
+            "💬 Комментарий: {comment}\n"
+            "👤 Создал: <b>{user}</b>\n"
+            .format(
+                wh=h(wh.name),
+                prod=h(prod.name),
+                art=h(prod.article),
+                qty=h(str(mv.qty)),
+                comment=h(mv.comment or "—"),
+                user=h(usr.name or str(usr.id)),
+            )
         )
+        parts.append("")  # пустая строка между позициями
+
+    text = "\n".join(parts).strip()
 
     kb = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="⬅️ Назад к документам", callback_data="view_docs")],
     ])
-    await send_content(cb, text.strip(), reply_markup=kb, parse_mode="Markdown")
+    await send_content(cb, text, reply_markup=kb, parse_mode="HTML")
 
 
 # ===== Добавить документ (текущий флоу) =====
@@ -261,8 +284,9 @@ async def pick_product(cb: types.CallbackQuery, user: User, state: FSMContext):
     await state.set_state(IncomingState.entering_qty)
     await send_content(
         cb,
-        f"📦 Товар: *{product.name}* (арт. {product.article})\n\n➡️ Введите количество (>0):",
-        reply_markup=qty_kb(back_to="rcv_back_products")
+        f"📦 Товар: <b>{h(product.name)}</b> (арт. <code>{h(product.article)}</code>)\n\n➡️ Введите количество (&gt;0):",
+        reply_markup=qty_kb(back_to="rcv_back_products"),
+        parse_mode="HTML",
     )
 
 
@@ -303,7 +327,8 @@ async def skip_comment(cb: types.CallbackQuery, user: User, state: FSMContext):
     await send_content(
         cb,
         confirm_text(data),
-        reply_markup=receiving_confirm_kb(confirm_prefix="rcv", back_to="rcv_back_comment")
+        reply_markup=receiving_confirm_kb(confirm_prefix="rcv", back_to="rcv_back_comment"),
+        parse_mode="HTML",
     )
 
 
@@ -313,8 +338,9 @@ async def back_to_qty(cb: types.CallbackQuery, user: User, state: FSMContext):
     await state.set_state(IncomingState.entering_qty)
     await send_content(
         cb,
-        f"📦 Товар: *{data['product_name']}* (арт. {data['product_article']})\n\n➡️ Введите количество (>0):",
-        reply_markup=qty_kb(back_to="rcv_back_products")
+        f"📦 Товар: <b>{h(str(data['product_name']))}</b> (арт. <code>{h(str(data['product_article']))}</code>)\n\n➡️ Введите количество (&gt;0):",
+        reply_markup=qty_kb(back_to="rcv_back_products"),
+        parse_mode="HTML",
     )
 
 
@@ -327,18 +353,18 @@ async def set_comment(message: types.Message, user: User, state: FSMContext):
     await state.set_state(IncomingState.confirming)
     await message.answer(
         confirm_text({**data, "comment": comment}),
-        parse_mode="Markdown",
-        reply_markup=receiving_confirm_kb(confirm_prefix="rcv", back_to="rcv_back_comment")
+        reply_markup=receiving_confirm_kb(confirm_prefix="rcv", back_to="rcv_back_comment"),
+        parse_mode="HTML",
     )
 
 
 def confirm_text(data: dict) -> str:
     return (
-        "📑 **Подтвердите поступление:**\n\n"
-        f"🏬 Склад: *{data['warehouse_name']}*\n"
-        f"📦 Товар: *{data['product_name']}* (арт. {data['product_article']})\n"
-        f"➡️ Количество: *{data['qty']}*\n"
-        f"💬 Комментарий: {data.get('comment') or '—'}\n"
+        "📑 <b>Подтвердите поступление:</b>\n\n"
+        f"🏬 Склад: <b>{h(str(data['warehouse_name']))}</b>\n"
+        f"📦 Товар: <b>{h(str(data['product_name']))}</b> (арт. <code>{h(str(data['product_article']))}</code>)\n"
+        f"➡️ Количество: <b>{h(str(data['qty']))}</b>\n"
+        f"💬 Комментарий: {h(data.get('comment') or '—')}\n"
     )
 
 
@@ -378,6 +404,7 @@ async def confirm(cb: types.CallbackQuery, user: User, state: FSMContext):
             product_id=data["product_id"],
             qty=data["qty"],
             type=MovementType.prihod,
+            stage=ProductStage.raw,
             user_id=user.id,
             doc_id=next_doc,
             comment=data.get("comment", ""),
@@ -388,15 +415,15 @@ async def confirm(cb: types.CallbackQuery, user: User, state: FSMContext):
 
     await state.clear()
     done = (
-        f"✅ Поступление записано.\n\n"
-        f"📑 Документ № *{sm.doc_id}*\n"
-        f"📅 Дата: *{sm.date.strftime('%Y-%m-%d %H:%M:%S')}*\n"
-        f"🏬 Склад: *{data['warehouse_name']}*\n"
-        f"📦 Товар: *{data['product_name']}* (арт. {data['product_article']})\n"
-        f"➡️ Количество: *{data['qty']}*\n"
-        f"💬 Комментарий: {data.get('comment') or '—'}"
+        f"✅ <b>Поступление записано.</b>\n\n"
+        f"📑 Документ № <b>{h(str(sm.doc_id))}</b>\n"
+        f"📅 Дата: <b>{h(sm.date.strftime('%Y-%m-%d %H:%M:%S'))}</b>\n"
+        f"🏬 Склад: <b>{h(str(data['warehouse_name']))}</b>\n"
+        f"📦 Товар: <b>{h(str(data['product_name']))}</b> (арт. <code>{h(str(data['product_article']))}</code>)\n"
+        f"➡️ Количество: <b>{h(str(data['qty']))}</b>\n"
+        f"💬 Комментарий: {h(data.get('comment') or '—')}"
     )
-    await send_content(cb, done, reply_markup=kb_receiving_root())
+    await send_content(cb, done, reply_markup=kb_receiving_root(), parse_mode="HTML")
 
 
 def register_receiving_handlers(dp: Dispatcher):

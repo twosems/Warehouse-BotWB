@@ -7,17 +7,25 @@ from utils.pagination import build_pagination_keyboard
 
 
 def confirm_kb(prefix: str = "rcv") -> InlineKeyboardMarkup:
-    """Универсальная клавиатура подтверждения (Подтвердить / Назад)."""
+    """
+    Универсальная клавиатура подтверждения (Подтвердить / Назад).
+    Клик: <prefix>_confirm / <prefix>_back
+    """
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"{prefix}_confirm")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"{prefix}_back")],
     ])
 
 
-def warehouses_kb(warehouses: List[Warehouse], prefix: str = "rcv_wh") -> InlineKeyboardMarkup:
+def warehouses_kb(
+        warehouses: List[Warehouse],
+        prefix: str = "rcv_wh",
+) -> InlineKeyboardMarkup:
     """
-    Список складов (СПб и Томск — первыми), плюс кнопка назад.
-    callback_data: rcv_wh:{id}  # Уникальный префикс для receiving
+    Список складов (СПб и Томск — первыми), плюс кнопка «Назад к меню».
+    callback_data: <prefix>:<id>
+      - для Receiving используйте prefix="rcv_wh"
+      - для Stocks/Reports — свой (например, "pr_wh", "rep_wh")
     """
     order = {"Санкт-Петербург": 0, "Томск": 1}
     warehouses_sorted = sorted(warehouses, key=lambda w: order.get(w.name, 99))
@@ -25,7 +33,6 @@ def warehouses_kb(warehouses: List[Warehouse], prefix: str = "rcv_wh") -> Inline
     rows: List[List[InlineKeyboardButton]] = []
     for w in warehouses_sorted:
         label = ("🏙️ " if w.name == "Санкт-Петербург" else "🏔️ " if w.name == "Томск" else "") + w.name
-  #     rows.append([InlineKeyboardButton(text=label, callback_data=f"rcv_wh:{w.id}")])
         rows.append([InlineKeyboardButton(text=label, callback_data=f"{prefix}:{w.id}")])
 
     rows.append([InlineKeyboardButton(text="⬅️ Назад к меню", callback_data="back_to_menu")])
@@ -37,14 +44,17 @@ def products_page_kb(
         page: int,
         page_size: int,
         total: int,
-        back_to: Optional[str] = None
+        back_to: Optional[str] = None,
+        item_prefix: str = "rcv_prod",
+        page_prefix: str = "rcv_prod_page",
 ) -> InlineKeyboardMarkup:
     """
     Список товаров с пагинацией.
     callback_data:
-      - rcv_prod:{product_id}  # Уникальный префикс для receiving
-      - rcv_prod_page:{page}
-      - back_to (например, rcv_back_wh)
+      - <item_prefix>:<product_id>   (по умолчанию rcv_prod:<id>)
+      - <page_prefix>:<page>         (по умолчанию rcv_prod_page:<n>)
+      - back_to (например, rcv_back_wh / stocks_back_wh / reports_back)
+    Для отчётов укажите, например: item_prefix="report_art", page_prefix="report_art_page".
     """
     rows: List[List[InlineKeyboardButton]] = []
 
@@ -52,7 +62,7 @@ def products_page_kb(
     for p in products:
         rows.append([InlineKeyboardButton(
             text=f"{p.name} (арт. {p.article})",
-            callback_data=f"rcv_prod:{p.id}"
+            callback_data=f"{item_prefix}:{p.id}"
         )])
 
     # Пагинация
@@ -60,8 +70,8 @@ def products_page_kb(
         page=page,
         page_size=page_size,
         total=total,
-        prev_cb_prefix="rcv_prod_page",
-        next_cb_prefix="rcv_prod_page",
+        prev_cb_prefix=page_prefix,
+        next_cb_prefix=page_prefix,
         prev_text="◀ Предыдущая",
         next_text="Следующая ▶"
     )
@@ -77,32 +87,50 @@ def products_page_kb(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def qty_kb(back_to: str) -> InlineKeyboardMarkup:
+def qty_kb(back_to: str, cancel_to: Optional[str] = None) -> InlineKeyboardMarkup:
     """
     Клавиатура для шага ввода количества.
-    back_to: callback_data для шага "назад" (например, rcv_back_products)
+    back_to: callback_data для шага «назад»
+    cancel_to: (опционально) callback_data для «Отмена»
     """
-    return InlineKeyboardMarkup(inline_keyboard=[
+    rows: List[List[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_to)],
-    ])
+    ]
+    if cancel_to:
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_to)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def comment_kb(back_to: str) -> InlineKeyboardMarkup:
+def comment_kb(back_to: str, cancel_to: Optional[str] = None, skip_cb: str = "rcv_skip_comment") -> InlineKeyboardMarkup:
     """
-    Клавиатура для комментария (Пропустить / Назад).
+    Клавиатура для комментария (Пропустить / Назад / (опц.) Отмена).
+    skip_cb: callback_data для «Пропустить комментарий»
     """
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏭ Пропустить комментарий", callback_data="rcv_skip_comment")],
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="⏭ Пропустить комментарий", callback_data=skip_cb)],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_to)],
-    ])
+    ]
+    if cancel_to:
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_to)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def receiving_confirm_kb(confirm_prefix: str, back_to: str) -> InlineKeyboardMarkup:
+def receiving_confirm_kb(
+        confirm_prefix: str,
+        back_to: str,
+        cancel_to: Optional[str] = None,
+        confirm_text: str = "✅ Добавить",
+) -> InlineKeyboardMarkup:
     """
-    Клавиатура подтверждения поступления.
+    Клавиатура подтверждения поступления/действия.
     confirm_prefix="rcv" → "rcv_confirm"
+    back_to: callback «назад»
+    cancel_to: (опц.) callback «отмена»
     """
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Добавить", callback_data=f"{confirm_prefix}_confirm")],
+    rows: List[List[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text=confirm_text, callback_data=f"{confirm_prefix}_confirm")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_to)],
-    ])
+    ]
+    if cancel_to:
+        rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_to)])
+    return InlineKeyboardMarkup(inline_keyboard=rows)

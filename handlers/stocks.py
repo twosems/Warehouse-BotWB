@@ -28,15 +28,18 @@ def kb_stocks_root():
 async def stocks_root(cb: types.CallbackQuery, user: User, state: FSMContext):
     await cb.answer()
     await state.clear()
-    await send_content(cb, "Остатки товара на складах — выберите действие:",
-                       reply_markup=kb_stocks_root())
+    await send_content(
+        cb,
+        "Остатки товара на складах — выберите действие:",
+        reply_markup=kb_stocks_root(),
+    )
 
 
 def kb_report_type():
-    """Клавиатура выбора типа отчета с кнопкой назад."""
+    """Клавиатура выбора типа отчёта с кнопкой назад."""
     return types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="📊 Отчет по всем товарам", callback_data="report_all")],
-        [types.InlineKeyboardButton(text="🔍 Отчет по артикулу", callback_data="report_article")],
+        [types.InlineKeyboardButton(text="📊 Отчёт по всем товарам", callback_data="report_all")],
+        [types.InlineKeyboardButton(text="🔍 Отчёт по артикулу", callback_data="report_article")],
         [types.InlineKeyboardButton(text="⬅️ Назад к складам", callback_data="stocks_back_to_wh")],
     ])
 
@@ -69,12 +72,14 @@ async def stocks_view(cb: types.CallbackQuery, user: User, state: FSMContext):
         await send_content(cb, "🚫 Нет активных складов.")
         return
 
-    await send_content(cb, "🏬 Выберите склад для просмотра остатков:",
-                       reply_markup=warehouses_kb(warehouses, prefix="pr_wh"))
-#                      reply_markup=warehouses_kb(warehouses))
+    await send_content(
+        cb,
+        "🏬 Выберите склад для просмотра остатков:",
+        reply_markup=warehouses_kb(warehouses, prefix="pr_wh"),
+    )
 
 
-# ===== Выбор склада для просмотра -> меню типа отчета =====
+# ===== Выбор склада для просмотра -> меню типа отчёта =====
 async def pick_warehouse_for_view(cb: types.CallbackQuery, user: User, state: FSMContext):
     if not cb.data.startswith("pr_wh:"):
         return
@@ -89,11 +94,15 @@ async def pick_warehouse_for_view(cb: types.CallbackQuery, user: User, state: FS
 
     await state.set_state(StockReportState.warehouse_selected)
     await state.update_data(wh_id=wh_id, wh_name=warehouse.name)
-    await send_content(cb, f"🏬 Склад: *{warehouse.name}*. Выберите тип отчета:",
-                       reply_markup=kb_report_type())
+    await send_content(
+        cb,
+        f"🏬 Склад: *{warehouse.name}*. Выберите тип отчёта:",
+        reply_markup=kb_report_type(),
+        parse_mode="Markdown",
+    )
 
 
-# ===== Отчет по всем товарам =====
+# ===== Отчёт по всем товарам =====
 async def report_all(cb: types.CallbackQuery, user: User, state: FSMContext):
     await cb.answer()
     data = await state.get_data()
@@ -120,15 +129,26 @@ async def report_all(cb: types.CallbackQuery, user: User, state: FSMContext):
         rows = res.all()
 
     if not rows:
-        await send_content(cb, f"📉 На складе *{wh_name}* нет товаров с остатками > 0.")
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="⬅️ Назад к типам отчёта", callback_data="back_to_report_type")],
+            [types.InlineKeyboardButton(text="🏬 Выбор склада", callback_data="stocks_back_to_wh")],
+        ])
+        await send_content(
+            cb,
+            f"📉 На складе *{wh_name}* сейчас нет товаров с остатком\n\n"
+            f"Выберите другой тип отчёта или склад.",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
         return
 
     total_items = len(rows)
     total_balance = sum(row.balance for row in rows)
-    lines = [f"🔹 `{row.article}` - *{row.name}*: **{row.balance}** шт." for row in rows]
+    lines = [f"🔹 `{row.article}` — *{row.name}*: **{row.balance}** шт." for row in rows]
     text = (
-            f"📊 **Остатки на складе {wh_name}** (товары с остатком > 0):\n\n"
-            + "\n\n".join(lines) + f"\n\n📈 **Итого:** {total_items} товаров, суммарный остаток: **{total_balance}** шт."
+            f"📊 **Остатки на складе {wh_name}**  Товары с остатком:\n\n"
+            + "\n\n".join(lines)
+            + f"\n\n📈 **Итого:** {total_items} товаров, суммарный остаток: **{total_balance}** шт."
     )
     parts = split_message(text)
 
@@ -139,12 +159,12 @@ async def report_all(cb: types.CallbackQuery, user: User, state: FSMContext):
 
     # Кнопка назад
     kb_back = types.InlineKeyboardMarkup(inline_keyboard=[
-        [types.InlineKeyboardButton(text="⬅️ Назад к типам отчета", callback_data="back_to_report_type")],
+        [types.InlineKeyboardButton(text="⬅️ Назад к типам отчёта", callback_data="back_to_report_type")],
     ])
     await cb.message.answer("Выберите дальнейшее действие:", reply_markup=kb_back)
 
 
-# ===== Отчет по артикулу: показ пагинированного списка =====
+# ===== Отчёт по артикулу: показ пагинированного списка =====
 async def report_article(cb: types.CallbackQuery, user: User, state: FSMContext):
     await cb.answer()
     await state.set_state(StockReportState.choosing_article)
@@ -160,9 +180,14 @@ async def report_articles_page(cb: types.CallbackQuery, user: User, state: FSMCo
 
     async with get_session() as session:
         # Total: только товары с balance > 0
-        subq = select(Product.id).join(StockMovement, StockMovement.product_id == Product.id).where(
-            Product.is_active == True, StockMovement.warehouse_id == wh_id
-        ).group_by(Product.id).having(func.sum(StockMovement.qty) > 0).subquery()
+        subq = (
+            select(Product.id)
+            .join(StockMovement, StockMovement.product_id == Product.id)
+            .where(Product.is_active == True, StockMovement.warehouse_id == wh_id)
+            .group_by(Product.id)
+            .having(func.sum(StockMovement.qty) > 0)
+            .subquery()
+        )
         total_stmt = select(func.count()).select_from(subq)
         total = await session.scalar(total_stmt)
 
@@ -180,22 +205,31 @@ async def report_articles_page(cb: types.CallbackQuery, user: User, state: FSMCo
         products = res.scalars().all()
 
     if not products:
-        await send_content(cb, "📉 Нет товаров с остатками > 0.")
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="⬅️ Назад к типам отчёта", callback_data="back_to_report_type")],
+            [types.InlineKeyboardButton(text="🏬 Выбор склада", callback_data="stocks_back_to_wh")],
+        ])
+        await send_content(
+            cb,
+            "📉 На этом складе сейчас нет товаров с остатком\n\n"
+            "Вернитесь назад и выберите другой тип отчёта или склад.",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
         return
 
-    # Клавиатура без "Отмена", с "Назад"
-    kb = products_page_kb(products, page, PAGE_SIZE_STOCKS, total, back_to="back_to_report_type")
-    # Подменяем callback_data и убираем "Отмена"
-    for row in kb.inline_keyboard:
-        for btn in row[:]:  # Копируем список для безопасного удаления
-            if btn.callback_data and btn.callback_data.startswith("pr_prod:"):
-                btn.callback_data = btn.callback_data.replace("pr_prod:", "report_art:")
-            elif btn.callback_data and btn.callback_data.startswith("pr_prod_page:"):
-                btn.callback_data = btn.callback_data.replace("pr_prod_page:", "report_art_page:")
-            elif btn.text == "❌ Отмена":
-                row.remove(btn)
+    # Универсальная клавиатура с «отчётными» префиксами (не конфликтует с Receiving)
+    kb = products_page_kb(
+        products=products,
+        page=page,
+        page_size=PAGE_SIZE_STOCKS,
+        total=total,
+        back_to="back_to_report_type",
+        item_prefix="report_art",
+        page_prefix="report_art_page",
+    )
 
-    await send_content(cb, "🔍 Выберите артикул для отчета:", reply_markup=kb)
+    await send_content(cb, "🔍 Выберите артикул для отчёта:", reply_markup=kb)
 
 
 # ===== Выбор артикула -> показ остатка =====
@@ -240,13 +274,17 @@ async def pick_article(cb: types.CallbackQuery, user: User, state: FSMContext):
     await cb.message.answer("Выберите дальнейшее действие:", reply_markup=kb_back)
 
 
-# ===== Назад к типу отчета =====
+# ===== Назад к типу отчёта =====
 async def back_to_report_type(cb: types.CallbackQuery, user: User, state: FSMContext):
     await cb.answer()
     data = await state.get_data()
     wh_name = data.get('wh_name', 'неизвестен')
-    await send_content(cb, f"🏬 Склад: *{wh_name}*. Выберите тип отчета:",
-                       reply_markup=kb_report_type())
+    await send_content(
+        cb,
+        f"🏬 Склад: *{wh_name}*. Выберите тип отчёта:",
+        reply_markup=kb_report_type(),
+        parse_mode="Markdown",
+    )
 
 
 # ===== Пагинация для артикулов =====
@@ -268,7 +306,7 @@ def register_stocks_handlers(dp: Dispatcher):
     dp.callback_query.register(stocks_root, lambda c: c.data == "stocks")
     dp.callback_query.register(stocks_view, lambda c: c.data == "stocks_view")
 
-    # Флоу для просмотра/отчета
+    # Флоу для просмотра/отчёта
     dp.callback_query.register(pick_warehouse_for_view, lambda c: c.data.startswith("pr_wh:"))
     dp.callback_query.register(report_all, lambda c: c.data == "report_all")
     dp.callback_query.register(report_article, lambda c: c.data == "report_article")
