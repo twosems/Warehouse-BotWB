@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List
 from aiogram.types import InlineKeyboardButton
 
 
@@ -10,39 +10,47 @@ def build_pagination_keyboard(
         next_cb_prefix: str,
         prev_text: str = "◀ Предыдущая",
         next_text: str = "Следующая ▶",
+        noop_cb: str = "noop",
 ) -> List[InlineKeyboardButton]:
     """
-    Создает универсальные кнопки пагинации (в одну строку).
-    Если элементов на одной странице >= общего количества — возвращает [].
+    Возвращает ОДНУ строку кнопок пагинации (List[InlineKeyboardButton]).
+    Если страниц нет — возвращает пустой список [].
 
-    :param page: текущая страница (>=1)
-    :param page_size: элементов на странице
-    :param total: общее количество элементов
-    :param prev_cb_prefix: префикс callback_data для кнопки "Предыдущая"
-    :param next_cb_prefix: префикс callback_data для кнопки "Следующая"
-    :param prev_text: текст кнопки "Предыдущая"
-    :param next_text: текст кнопки "Следующая"
-    :return: список InlineKeyboardButton для одной строки
+    Правила:
+      - aiogram v3 требует именованные аргументы у InlineKeyboardButton.
+      - Центральная кнопка (N/M) и "заблокированные" стрелки используют callback 'noop'.
+      - Ожидается, что вызывающая сторона добавляет полученную строку в inline_keyboard:
+          row = build_pagination_keyboard(...);  if row: rows.append(row)
     """
     if page_size <= 0:
         raise ValueError("page_size должен быть > 0")
 
-    total_pages = max(1, -(-total // page_size))  # math.ceil без импорта
+    # ceil(total / page_size) без math
+    total_pages = max(1, -(-total // page_size))
 
     # Пагинация не нужна
     if total <= page_size or total_pages <= 1:
         return []
 
-    row = []
-    if page > 1:
-        row.append(InlineKeyboardButton(
-            prev_text,
-            callback_data=f"{prev_cb_prefix}:{page-1}"
-        ))
-    if page < total_pages:
-        row.append(InlineKeyboardButton(
-            next_text,
-            callback_data=f"{next_cb_prefix}:{page+1}"
-        ))
+    # В какую сторону можем листать
+    has_prev = page > 1
+    has_next = page < total_pages
 
+    prev_cb = f"{prev_cb_prefix}:{page-1}" if has_prev else noop_cb
+    next_cb = f"{next_cb_prefix}:{page+1}" if has_next else noop_cb
+
+    row: List[InlineKeyboardButton] = [
+        InlineKeyboardButton(
+            text=(prev_text if has_prev else "⛔"),
+            callback_data=prev_cb,
+        ),
+        InlineKeyboardButton(
+            text=f"{page}/{total_pages}",
+            callback_data=noop_cb,
+        ),
+        InlineKeyboardButton(
+            text=(next_text if has_next else "⛔"),
+            callback_data=next_cb,
+        ),
+    ]
     return row

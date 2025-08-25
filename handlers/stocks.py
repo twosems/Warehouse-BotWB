@@ -6,7 +6,7 @@ from sqlalchemy import select, func, and_
 from sqlalchemy.orm import aliased
 
 from database.db import get_session
-from database.models import User, Warehouse, Product, StockMovement
+from database.models import User, Warehouse, Product, StockMovement, ProductStage
 from handlers.common import send_content
 from keyboards.inline import warehouses_kb, products_page_kb
 
@@ -39,6 +39,7 @@ def kb_report_type():
     """Клавиатура выбора типа отчёта с кнопкой назад."""
     return types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="📊 Отчёт по всем товарам", callback_data="report_all")],
+        [types.InlineKeyboardButton(text="🎁 Упакованные остатки", callback_data="report_packed")],
         [types.InlineKeyboardButton(text="🔍 Отчёт по артикулу", callback_data="report_article")],
         [types.InlineKeyboardButton(text="⬅️ Назад к складам", callback_data="stocks_back_to_wh")],
     ])
@@ -158,6 +159,70 @@ async def report_all(cb: types.CallbackQuery, user: User, state: FSMContext):
         await cb.message.answer(part, parse_mode="Markdown")
 
     # Кнопка назад
+    kb_back = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="⬅️ Назад к типам отчёта", callback_data="back_to_report_type")],
+    ])
+    await cb.message.answer("Выберите дальнейшее действие:", reply_markup=kb_back)
+
+
+# ===== НОВОЕ: Упакованные остатки (stage=packed) =====
+async def report_packed(cb: types.CallbackQuery, user: User, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    wh_id = data.get('wh_id')
+    wh_name = data.get('wh_name')
+    if not wh_id:
+        await send_content(cb, "❗ Ошибка: склад не выбран.")
+        return
+
+    SM = aliased(StockMovement)
+    async with get_session() as session:
+        res = await session.execute(
+            select(
+                Product.article,
+                Product.name,
+                func.sum(SM.qty).label("balance")
+            )
+            .join(SM, and_(
+                SM.product_id == Product.id,
+                SM.warehouse_id == wh_id,
+                SM.stage == ProductStage.packed
+            ))
+            .where(Product.is_active == True)
+            .group_by(Product.id)
+            .having(func.sum(SM.qty) > 0)
+            .order_by(Product.article)
+        )
+        rows = res.all()
+
+    if not rows:
+        kb = types.InlineKeyboardMarkup(inline_keyboard=[
+            [types.InlineKeyboardButton(text="⬅️ Назад к типам отчёта", callback_data="back_to_report_type")],
+            [types.InlineKeyboardButton(text="🏬 Выбор склада", callback_data="stocks_back_to_wh")],
+        ])
+        await send_content(
+            cb,
+            f"📭 На складе *{wh_name}* нет упакованных остатков.",
+            parse_mode="Markdown",
+            reply_markup=kb,
+        )
+        return
+
+    total_items = len(rows)
+    total_balance = sum(row.balance for row in rows)
+    lines = [f"🎁 `{row.article}` — *{row.name}*: **{row.balance}** шт." for row in rows]
+    text = (
+            f"🎁 **Упакованные остатки на складе {wh_name}**\n\n"
+            + "\n\n".join(lines)
+            + f"\n\n📈 **Итого:** {total_items} товаров, упаковано: **{total_balance}** шт."
+    )
+    parts = split_message(text)
+
+    for i, part in enumerate(parts, 1):
+        if len(parts) > 1:
+            part = f"Часть {i}/{len(parts)}:\n\n{part}"
+        await cb.message.answer(part, parse_mode="Markdown")
+
     kb_back = types.InlineKeyboardMarkup(inline_keyboard=[
         [types.InlineKeyboardButton(text="⬅️ Назад к типам отчёта", callback_data="back_to_report_type")],
     ])
@@ -309,6 +374,7 @@ def register_stocks_handlers(dp: Dispatcher):
     # Флоу для просмотра/отчёта
     dp.callback_query.register(pick_warehouse_for_view, lambda c: c.data.startswith("pr_wh:"))
     dp.callback_query.register(report_all, lambda c: c.data == "report_all")
+    dp.callback_query.register(report_packed, lambda c: c.data == "report_packed")  # <— НОВОЕ
     dp.callback_query.register(report_article, lambda c: c.data == "report_article")
     dp.callback_query.register(report_articles_page_handler, lambda c: c.data.startswith("report_art_page:"))
     dp.callback_query.register(pick_article, lambda c: c.data.startswith("report_art:"))

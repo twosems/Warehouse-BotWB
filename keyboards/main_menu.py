@@ -7,15 +7,17 @@ from database.db import get_session
 from database.menu_visibility import get_visible_menu_items_for_role
 from database.models import UserRole, MenuItem
 
-
-# порядок и тексты кнопок
+# порядок и тексты кнопок (callback_data в третьей колонке)
 ITEMS = [
-    (MenuItem.stocks,    "📦 Остатки",     "stocks"),
-    (MenuItem.receiving, "➕ Поступление", "receiving"),
-    (MenuItem.supplies,  "🚚 Поставки",    "supplies"),
-    (MenuItem.packing,   "🎁 Упаковка",    "packing"),
-    (MenuItem.picking,   "🧰 Сборка",      "picking"),
-    (MenuItem.reports,   "📈 Отчёты",      "reports"),
+    (MenuItem.stocks,        "📦 Остатки",      "stocks"),
+    (MenuItem.receiving,     "➕ Поступление",  "receiving"),
+    (MenuItem.supplies,      "🚚 Поставки",     "supplies"),
+    (MenuItem.packing,       "🎁 Упаковка",     "packing"),
+    (MenuItem.picking,       "🧰 Сборка",       "picking"),
+    (MenuItem.reports,       "📈 Отчёты",       "reports"),
+    # ▼ НОВОЕ ▼
+    (MenuItem.purchase_cn,   "🇨🇳 Закупка CN",  "cn:root"),
+    (MenuItem.msk_warehouse, "🏢 Склад MSK",    "msk:root"),
     # admin вынесем отдельной строкой ниже
 ]
 
@@ -32,7 +34,7 @@ async def get_main_menu(role: UserRole) -> InlineKeyboardMarkup:
 
     rows: list[list[InlineKeyboardButton]] = []
 
-    # делаем аккуратную сетку по 2 кнопки в ряд
+    # сетка: по 2 кнопки в ряд
     buf: list[InlineKeyboardButton] = []
     for item, text, cb in ITEMS:
         if not is_visible(item):

@@ -175,6 +175,19 @@ async def back_to_main_menu(cb: types.CallbackQuery, user: User, state: FSMConte
     # здесь тоже асинхронный вызов
     await cb.message.answer("Главное меню:", reply_markup=await get_main_menu(user.role))
 
+# handlers/common.py (фрагмент в конце файла)
+from aiogram import Router, types, F
+
+noop_router = Router()
+
+@noop_router.callback_query(F.data == "noop")
+async def noop_cb(cb: types.CallbackQuery):
+    # просто закрываем "часики" у кнопки; действий не требуется
+    await cb.answer()
+
+
+# в функции регистрации роутеров/в bot.py обязательно подключи ПОСЛЕДНИМ:
+# dp.include_router(noop_router)
 
 def register_common_handlers(dp: Dispatcher):
     dp.message.register(cmd_start, CommandStart())

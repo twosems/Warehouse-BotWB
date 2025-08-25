@@ -1,264 +1,530 @@
 # handlers/packing.py
-from aiogram import Router, Dispatcher, F, types
+from __future__ import annotations
+
+import datetime
+from typing import Dict, List, Tuple, Union
+
+from aiogram import Router, F, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, and_, desc
+from sqlalchemy.orm import aliased
 
 from database.db import get_session
 from database.models import (
+    User, UserRole,
     Warehouse, Product, StockMovement,
-    MovementType, ProductStage, User
+    ProductStage, MovementType,
+    PackDoc, PackDocItem,
 )
+from handlers.common import send_content
+from keyboards.inline import warehouses_kb
 
 router = Router()
-PAGE_SIZE = 10
 
-# ---------- FSM ----------
+# сколько товаров показываем на странице при подборе
+PAGE_SIZE = 12
+
+
 class PackFSM(StatesGroup):
-    WH = State()
-    PRODUCTS = State()
-    QTY = State()
-    CONFIRM = State()
+    choose_wh = State()
+    picking = State()
+    input_qty = State()
 
-# ---------- Keyboards ----------
-def kb_wh_list(warehouses, page=0) -> InlineKeyboardMarkup:
-    start = page * PAGE_SIZE
-    chunk = warehouses[start:start + PAGE_SIZE]
-    rows = [[InlineKeyboardButton(text=name, callback_data=f"pack:wh:{wid}")]
-            for wid, name in chunk]
-    nav = []
-    if start > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"pack:wh:page:{page-1}"))
-    if start + PAGE_SIZE < len(warehouses):
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"pack:wh:page:{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="pack:cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
-def kb_products_list(products, page=0, wh_id: int = 0) -> InlineKeyboardMarkup:
-    start = page * PAGE_SIZE
-    chunk = products[start:start + PAGE_SIZE]
-    rows = [[InlineKeyboardButton(
-        text=f"{name} (art. {article}) — RAW {raw}",
-        callback_data=f"pack:p:{wh_id}:{pid}"
-    )] for pid, name, article, raw in chunk]
-    nav = []
-    if start > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"pack:p:page:{page-1}"))
-    if start + PAGE_SIZE < len(products):
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"pack:p:page:{page+1}"))
-    if nav:
-        rows.append(nav)
-    rows.append([InlineKeyboardButton(text="⬅️ Склад", callback_data="pack:back_wh")])
-    rows.append([InlineKeyboardButton(text="❌ Отмена", callback_data="pack:cancel")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+# ===== ВСПОМОГАТЕЛЬНЫЕ =====
 
-def kb_confirm() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Провести упаковку", callback_data="pack:do")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="pack:cancel")],
+async def _raw_map(session, wh_id: int) -> Dict[int, int]:
+    """
+    Карта RAW остатков по складу: product_id -> qty (>0)
+    """
+    SM = aliased(StockMovement)
+    rows = await session.execute(
+        select(SM.product_id, func.sum(SM.qty).label("qty"))
+        .where(and_(SM.warehouse_id == wh_id, SM.stage == ProductStage.raw))
+        .group_by(SM.product_id)
+        .having(func.sum(SM.qty) > 0)
+    )
+    return {pid: qty for pid, qty in rows.all()}
+
+
+async def _next_pack_number(session, wh_id: int) -> str:
+    """
+    Генерация номера документа: YYYYMMDD-XXX в разрезе склада и дня
+    """
+    today = datetime.date.today()
+    start = datetime.datetime.combine(today, datetime.time.min)
+    end = datetime.datetime.combine(today, datetime.time.max)
+    last = await session.scalar(
+        select(PackDoc.number)
+        .where(and_(PackDoc.warehouse_id == wh_id, PackDoc.created_at.between(start, end)))
+        .order_by(desc(PackDoc.id))
+        .limit(1)
+    )
+    seq = 1
+    if last and "-" in last:
+        try:
+            seq = int(last.split("-")[-1]) + 1
+        except Exception:
+            seq = 1
+    return f"{today.strftime('%Y%m%d')}-{seq:03d}"
+
+
+def _cart_summary(cart: Dict[int, int]) -> Tuple[int, int]:
+    """
+    Возвращает (кол-во позиций, суммарное qty) для корзины
+    """
+    if not cart:
+        return 0, 0
+    return len(cart), sum(cart.values())
+
+
+# Универсальная inline‑кнопка «Назад»
+def back_inline_kb(target: str = "back_to_packing") -> types.InlineKeyboardMarkup:
+    return types.InlineKeyboardMarkup(
+        inline_keyboard=[[types.InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]]
+    )
+
+
+def _kb_picking(
+        products_rows: List[Tuple[int, str, str | None, int]],
+        page: int,
+        pages: int,
+        cart_cnt: int,
+        cart_sum: int,
+) -> types.InlineKeyboardMarkup:
+    """
+    Клавиатура для страницы подбора: список товаров (RAW>0), пагинация, корзина/назад
+    """
+    rows: List[List[types.InlineKeyboardButton]] = []
+
+    for pid, name, art, raw_qty in products_rows:
+        caption = f"{name} (арт. {art or '—'}) • RAW: {raw_qty}"
+        rows.append([types.InlineKeyboardButton(text=caption, callback_data=f"pack_add:{pid}")])
+
+    # пагинация
+    if pages > 1:
+        prev_cb = f"pack_page:{page-1}" if page > 1 else "noop"
+        next_cb = f"pack_page:{page+1}" if page < pages else "noop"
+        rows.append([
+            types.InlineKeyboardButton(text="◀", callback_data=prev_cb),
+            types.InlineKeyboardButton(text=f"{page}/{pages}", callback_data="noop"),
+            types.InlineKeyboardButton(text="▶", callback_data=next_cb),
+        ])
+
+    # корзина/навигация
+    rows.append([
+        types.InlineKeyboardButton(text=f"🧾 Корзина ({cart_cnt}/{cart_sum})", callback_data="pack_cart"),
     ])
+    rows.append([
+        types.InlineKeyboardButton(text="⬅️ Назад к складам", callback_data="pack_back_wh"),
+        types.InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_packing"),
+    ])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
 
-# ---------- Helpers ----------
-async def _warehouses_list() -> list[tuple[int, str]]:
-    async with get_session() as s:
-        rows = (await s.execute(
-            select(Warehouse.id, Warehouse.name)
-            .where((Warehouse.is_active.is_(True)) | (Warehouse.is_active.is_(None)))
-            .order_by(Warehouse.name.asc())
-        )).all()
-        items = [(r[0], r[1]) for r in rows]
-        # ренейм дублей
-        counts = {}
-        for _, n in items:
-            counts[n] = counts.get(n, 0) + 1
-        return [(wid, name if counts[name] == 1 else f"{name} (#{wid})") for wid, name in items]
 
-async def _products_with_raw(session: AsyncSession, warehouse_id: int) -> list[tuple[int, str, str, int]]:
-    sm = StockMovement
-    p = Product
-    raw_sum = select(
-        sm.product_id.label("pid"),
-        func.coalesce(func.sum(sm.qty), 0).label("raw_balance")
-    ).where(
-        sm.warehouse_id == warehouse_id,
-        sm.stage == ProductStage.raw
-    ).group_by(sm.product_id).subquery()
+def _kb_cart(can_post: bool) -> types.InlineKeyboardMarkup:
+    """
+    Клавиатура для корзины (редактирование позиций, создание документа)
+    """
+    rows: List[List[types.InlineKeyboardButton]] = []
 
-    q = select(p.id, p.name, p.article, raw_sum.c.raw_balance) \
-        .join(raw_sum, raw_sum.c.pid == p.id) \
-        .where(raw_sum.c.raw_balance > 0) \
-        .order_by(p.name.asc())
-
-    rows = (await session.execute(q)).all()
-    return [(r[0], r[1], r[2], int(r[3])) for r in rows]
-
-async def _get_raw_balance(session: AsyncSession, warehouse_id: int, product_id: int) -> int:
-    val = (await session.execute(
-        select(func.coalesce(func.sum(StockMovement.qty), 0))
-        .where(StockMovement.warehouse_id == warehouse_id)
-        .where(StockMovement.product_id == product_id)
-        .where(StockMovement.stage == ProductStage.raw)
-    )).scalar()
-    return int(val or 0)
-
-async def _next_doc_id(session: AsyncSession) -> int:
-    val = (await session.execute(select(func.coalesce(func.max(StockMovement.doc_id), 0)))).scalar()
-    return int(val or 0) + 1
-
-# ---------- Entry points ----------
-async def _start_packing(message_or_cb, state: FSMContext):
-    ws = await _warehouses_list()
-    await state.set_state(PackFSM.WH)
-    if isinstance(message_or_cb, types.CallbackQuery):
-        await message_or_cb.message.edit_text("Выберите склад для упаковки:", reply_markup=kb_wh_list(ws, 0))
+    rows.append([types.InlineKeyboardButton(text="➕ Добавить ещё", callback_data="pack_continue")])
+    if can_post:
+        rows.append([types.InlineKeyboardButton(text="✅ Создать документ", callback_data="pack_post")])
     else:
-        await message_or_cb.answer("Выберите склад для упаковки:", reply_markup=kb_wh_list(ws, 0))
+        rows.append([types.InlineKeyboardButton(text="⛔ Нет позиций", callback_data="noop")])
 
-# 1) Из главного меню (inline callback "packing")
+    rows.append([
+        types.InlineKeyboardButton(text="🗑 Очистить", callback_data="pack_clear"),
+        types.InlineKeyboardButton(text="⬅️ Назад к подбору", callback_data="pack_continue"),
+    ])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _kb_docs(docs_rows: List[Tuple[int, str, datetime.datetime, str, int]]) -> types.InlineKeyboardMarkup:
+    """
+    Список документов упаковки
+    """
+    rows: List[List[types.InlineKeyboardButton]] = []
+    for did, number, created_at, wh_name, total in docs_rows:
+        label = f"№{number} • {created_at:%d.%m %H:%M} • {wh_name} • {total} шт."
+        rows.append([types.InlineKeyboardButton(text=label, callback_data=f"pack_doc:{did}")])
+    rows.append([types.InlineKeyboardButton(text="⬅️ Назад", callback_data="pack_root")])
+    return types.InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _render_picking(target: Union[types.CallbackQuery, types.Message], state: FSMContext):
+    """
+    Рендер страницы подбора (универсально для CallbackQuery/Message)
+    """
+    data = await state.get_data()
+    wh_name: str = data["wh_name"]
+    page: int = int(data.get("page", 1))
+    cart: Dict[int, int] = data.get("cart", {})
+    raw_map: Dict[int, int] = data["raw_map"]
+    products: List[Tuple[int, str, str | None]] = data["products"]
+
+    pages = max(1, (len(products) + PAGE_SIZE - 1) // PAGE_SIZE)
+    start, end = (page - 1) * PAGE_SIZE, (page - 1) * PAGE_SIZE + PAGE_SIZE
+    slice_rows = [(pid, name, art, raw_map.get(pid, 0)) for (pid, name, art) in products[start:end]]
+
+    cnt, summ = _cart_summary(cart)
+    text = f"🏬 *{wh_name}*\nВыберите товар для упаковки (RAW > 0).\n\n🧾 Корзина: {cnt} поз., {summ} шт."
+
+    await send_content(
+        target,
+        text,
+        parse_mode="Markdown",
+        reply_markup=_kb_picking(slice_rows, page, pages, cnt, summ),
+    )
+
+
+# ===== ROOT / МЕНЮ =====
+
 @router.callback_query(F.data == "packing")
-async def packing_entry_cb(cb: types.CallbackQuery, state: FSMContext, user: User):
-    await cb.answer()
-    await _start_packing(cb, state)
+async def pack_root(cb: types.CallbackQuery, user: User, state: FSMContext):
+    await state.clear()
+    kb = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="🆕 Новая упаковка", callback_data="pack_new")],
+        [types.InlineKeyboardButton(text="🏷 Документы упаковки", callback_data="pack_docs")],
+        [types.InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")],
+    ])
+    await send_content(cb, "Упаковка — выберите действие:", reply_markup=kb)
 
-# 2) На всякий случай — если есть текстовая кнопка
-@router.message(F.text.casefold().in_({"упаковка", "🎁 упаковка", "упаковка 🎁", "🎁упаковка"}))
-async def packing_entry_text(msg: types.Message, state: FSMContext, user: User):
-    await _start_packing(msg, state)
 
-# ---------- Flow ----------
-@router.callback_query(PackFSM.WH, F.data.startswith("pack:wh:page:"))
-async def wh_page(call: types.CallbackQuery, state: FSMContext):
-    page = int(call.data.split(":")[-1])
-    ws = await _warehouses_list()
-    await call.message.edit_reply_markup(reply_markup=kb_wh_list(ws, page))
+# ===== СОЗДАНИЕ НОВОЙ УПАКОВКИ =====
 
-@router.callback_query(PackFSM.WH, F.data.startswith("pack:wh:"))
-async def wh_pick(call: types.CallbackQuery, state: FSMContext):
-    wh_id = int(call.data.split(":")[-1])
-    async with get_session() as s:
-        products = await _products_with_raw(s, wh_id)
-    await state.update_data(warehouse_id=wh_id, products=products, page=0)
-    await state.set_state(PackFSM.PRODUCTS)
-    await call.message.edit_text("Выберите товар с положительным RAW-остатком:",
-                                 reply_markup=kb_products_list(products, 0, wh_id))
+@router.callback_query(F.data == "pack_new")
+async def pack_new(cb: types.CallbackQuery, user: User, state: FSMContext):
+    await state.clear()
+    async with get_session() as session:
+        wh = (await session.execute(
+            select(Warehouse).where(Warehouse.is_active == True).order_by(Warehouse.name)
+        )).scalars().all()
+    if not wh:
+        return await send_content(cb, "🚫 Нет активных складов.")
+    await state.set_state(PackFSM.choose_wh)
+    await send_content(cb, "Выберите склад для новой упаковки:", reply_markup=warehouses_kb(wh, prefix="pack_wh"))
 
-@router.callback_query(PackFSM.PRODUCTS, F.data == "pack:back_wh")
-async def back_to_wh(call: types.CallbackQuery, state: FSMContext):
-    ws = await _warehouses_list()
-    await state.set_state(PackFSM.WH)
-    await call.message.edit_text("Выберите склад для упаковки:", reply_markup=kb_wh_list(ws, 0))
 
-@router.callback_query(PackFSM.PRODUCTS, F.data.startswith("pack:p:page:"))
-async def products_page(call: types.CallbackQuery, state: FSMContext):
-    page = int(call.data.split(":")[-1])
-    data = await state.get_data()
-    products = data.get("products", [])
-    wh_id = data.get("warehouse_id")
+@router.callback_query(F.data.startswith("pack_wh:"))
+async def pack_choose_wh(cb: types.CallbackQuery, user: User, state: FSMContext):
+    # фикс состояния
+    if await state.get_state() != PackFSM.choose_wh:
+        await state.set_state(PackFSM.choose_wh)
+
+    wh_id = int(cb.data.split(":")[1])
+    async with get_session() as session:
+        wh = await session.get(Warehouse, wh_id)
+        if not wh or not wh.is_active:
+            return await send_content(cb, "🚫 Склад не найден или неактивен.")
+        raw = await _raw_map(session, wh_id)
+        if not raw:
+            return await send_content(cb, f"На складе *{wh.name}* нет RAW остатков.", parse_mode="Markdown")
+        prod_rows = (await session.execute(
+            select(Product.id, Product.name, Product.article)
+            .where(and_(Product.is_active == True, Product.id.in_(raw.keys())))
+            .order_by(Product.article)
+        )).all()
+
+    await state.update_data(
+        wh_id=wh_id,
+        wh_name=wh.name,
+        page=1,
+        cart={},
+        raw_map=raw,
+        products=prod_rows,
+    )
+    await state.set_state(PackFSM.picking)
+    await _render_picking(cb, state)
+
+
+@router.callback_query(F.data.startswith("pack_page:"))
+async def pack_page(cb: types.CallbackQuery, state: FSMContext):
+    page = int(cb.data.split(":")[1])
     await state.update_data(page=page)
-    await call.message.edit_reply_markup(reply_markup=kb_products_list(products, page, wh_id or 0))
+    await _render_picking(cb, state)
 
-@router.callback_query(PackFSM.PRODUCTS, F.data.startswith("pack:p:"))
-async def product_pick(call: types.CallbackQuery, state: FSMContext):
-    _, _, wh_id, pid = call.data.split(":")
-    wh_id = int(wh_id); pid = int(pid)
-    async with get_session() as s:
-        raw_bal = await _get_raw_balance(s, wh_id, pid)
-        prod = (await s.execute(select(Product.name, Product.article).where(Product.id == pid))).first()
-    if not prod:
-        return await call.answer("Товар не найден", show_alert=True)
-    name, article = prod
-    await state.update_data(product_id=pid)
-    await state.set_state(PackFSM.QTY)
-    await call.message.edit_text(
-        f"Товар: {name} (art. {article})\n"
-        f"Доступно сырья (RAW): {raw_bal}\n\n"
-        f"Введите количество для упаковки (целое > 0 и ≤ RAW):"
-    )
 
-@router.message(PackFSM.QTY)
-async def input_qty(message: types.Message, state: FSMContext):
-    txt = (message.text or "").strip()
-    if not txt.isdigit():
-        return await message.answer("Нужно положительное целое число. Введите ещё раз:")
-    qty = int(txt)
-    if qty <= 0:
-        return await message.answer("Количество должно быть > 0. Попробуйте ещё раз:")
+@router.callback_query(F.data.startswith("pack_add:"))
+async def pack_add(cb: types.CallbackQuery, state: FSMContext):
+    """
+    Клик по товару — запрос количества
+    """
+    pid = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    raw_map: Dict[int, int] = data["raw_map"]
+    can = int(raw_map.get(pid, 0))
+    if can <= 0:
+        return await cb.answer("Нет RAW остатка", show_alert=True)
+    await state.update_data(current_pid=pid, current_can=can)
+    await cb.message.answer(f"Введите количество для упаковки (доступно RAW: {can})")
+    await state.set_state(PackFSM.input_qty)
+
+
+@router.message(PackFSM.input_qty)
+async def pack_input_qty(msg: types.Message, state: FSMContext):
+    """
+    Обработка ручного ввода qty и возврат в подбор со свежей корзиной
+    """
+    try:
+        qty = int(msg.text.strip())
+        if qty <= 0:
+            raise ValueError
+    except Exception:
+        return await msg.answer("Введите целое положительное число.")
 
     data = await state.get_data()
-    wh_id = data["warehouse_id"]
-    pid = data["product_id"]
+    pid = data["current_pid"]
+    can = data["current_can"]
+    if qty > can:
+        return await msg.answer(f"Недостаточно RAW. Доступно: {can}")
 
-    async with get_session() as s:
-        raw_bal = await _get_raw_balance(s, wh_id, pid)
+    cart: Dict[int, int] = data.get("cart", {})
+    cart[pid] = cart.get(pid, 0) + qty
 
-    if qty > raw_bal:
-        return await message.answer(f"Нельзя упаковать {qty}: сырья только {raw_bal}. Введите меньшее количество:")
+    raw_map: Dict[int, int] = data["raw_map"]
+    raw_map[pid] = can - qty
 
-    await state.update_data(qty=qty)
-    await state.set_state(PackFSM.CONFIRM)
+    await state.update_data(cart=cart, raw_map=raw_map)
+    await state.set_state(PackFSM.picking)
 
-    async with get_session() as s:
-        prod = (await s.execute(select(Product.name, Product.article).where(Product.id == pid))).first()
-    name, article = prod
-    await message.answer(
-        f"Подтверждение упаковки:\n"
-        f"Склад: #{wh_id}\n"
-        f"Товар: {name} (art. {article})\n"
-        f"Количество: {qty}\n\n"
-        f"Провести?",
-        reply_markup=kb_confirm()
-    )
+    await msg.answer("Добавлено ✅")
+    await _render_picking(msg, state)
 
-@router.callback_query(PackFSM.CONFIRM, F.data == "pack:do")
-async def do_pack(call: types.CallbackQuery, state: FSMContext, user: User):
+
+# ===== КОРЗИНА И РЕДАКТИРОВАНИЕ =====
+
+@router.callback_query(F.data == "pack_cart")
+async def pack_cart(cb: types.CallbackQuery, state: FSMContext):
     data = await state.get_data()
-    wh_id = data["warehouse_id"]
-    pid = data["product_id"]
-    qty = data["qty"]
+    cart: Dict[int, int] = data.get("cart", {})
+    if not cart:
+        return await cb.answer("Корзина пуста", show_alert=True)
 
-    async with get_session() as s:
-        raw_bal = await _get_raw_balance(s, wh_id, pid)
-        if qty > raw_bal:
-            # вернёмся к списку товаров
-            products = await _products_with_raw(s, wh_id)
-            await state.update_data(products=products, page=0)
-            await state.set_state(PackFSM.PRODUCTS)
-            await call.message.edit_text(
-                f"⛔ Недостаточно сырья (RAW={raw_bal}, нужно {qty}). Выберите другой товар/количество.",
-                reply_markup=kb_products_list(products, 0, wh_id)
+    async with get_session() as session:
+        rows = (await session.execute(
+            select(Product.id, Product.name, Product.article).where(Product.id.in_(cart.keys()))
+        )).all()
+    info = {pid: (name, art) for pid, name, art in rows}
+
+    lines = ["🧾 *Подбор упаковки*:", ""]
+    total = 0
+    kb_rows: List[List[types.InlineKeyboardButton]] = []
+    idx = 1
+    for pid, q in cart.items():
+        name, art = info.get(pid, ("?", None))
+        lines.append(f"{idx}) `{art or pid}` — *{name}*: **{q}** шт.")
+        kb_rows.append([
+            types.InlineKeyboardButton(text="➖1", callback_data=f"pack_dec:{pid}"),
+            types.InlineKeyboardButton(text="➕1", callback_data=f"pack_inc:{pid}"),
+            types.InlineKeyboardButton(text="❌", callback_data=f"pack_del:{pid}"),
+        ])
+        total += q
+        idx += 1
+
+    lines += ["", f"📈 Итого: {len(cart)} позиций, {total} шт."]
+
+    # общие кнопки
+    kb_rows.append([types.InlineKeyboardButton(text="➕ Добавить ещё", callback_data="pack_continue")])
+    if total > 0:
+        kb_rows.append([types.InlineKeyboardButton(text="✅ Создать документ", callback_data="pack_post")])
+    kb_rows.append([
+        types.InlineKeyboardButton(text="🗑 Очистить", callback_data="pack_clear"),
+        types.InlineKeyboardButton(text="⬅️ Назад к подбору", callback_data="pack_continue"),
+    ])
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+    await send_content(cb, "\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("pack_inc:"))
+async def pack_inc(cb: types.CallbackQuery, state: FSMContext):
+    pid = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    cart: Dict[int, int] = data.get("cart", {})
+    raw_map: Dict[int, int] = data.get("raw_map", {})
+    can_left = int(raw_map.get(pid, 0))
+    if can_left <= 0:
+        return await cb.answer("Нет RAW для увеличения", show_alert=True)
+    cart[pid] = cart.get(pid, 0) + 1
+    raw_map[pid] = can_left - 1
+    await state.update_data(cart=cart, raw_map=raw_map)
+    await pack_cart(cb, state)
+
+
+@router.callback_query(F.data.startswith("pack_dec:"))
+async def pack_dec(cb: types.CallbackQuery, state: FSMContext):
+    pid = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    cart: Dict[int, int] = data.get("cart", {})
+    q = cart.get(pid, 0)
+    if q <= 0:
+        return await cb.answer("Эта позиция уже 0", show_alert=True)
+    cart[pid] = q - 1
+    # возвращаем RAW доступность
+    raw_map: Dict[int, int] = data.get("raw_map", {})
+    raw_map[pid] = raw_map.get(pid, 0) + 1
+    if cart[pid] == 0:
+        del cart[pid]
+    await state.update_data(cart=cart, raw_map=raw_map)
+    await pack_cart(cb, state)
+
+
+@router.callback_query(F.data.startswith("pack_del:"))
+async def pack_del(cb: types.CallbackQuery, state: FSMContext):
+    pid = int(cb.data.split(":")[1])
+    data = await state.get_data()
+    cart: Dict[int, int] = data.get("cart", {})
+    q = cart.pop(pid, 0)
+    raw_map: Dict[int, int] = data.get("raw_map", {})
+    raw_map[pid] = raw_map.get(pid, 0) + q
+    await state.update_data(cart=cart, raw_map=raw_map)
+    await cb.answer("Удалено")
+    await pack_cart(cb, state)
+
+
+@router.callback_query(F.data == "pack_clear")
+async def pack_clear(cb: types.CallbackQuery, state: FSMContext):
+    """
+    Очистить корзину и пересчитать доступный RAW из базы
+    """
+    data = await state.get_data()
+    async with get_session() as session:
+        raw = await _raw_map(session, data["wh_id"])
+    await state.update_data(cart={}, raw_map=raw)
+    await cb.answer("Корзина очищена")
+    await _render_picking(cb, state)
+
+
+@router.callback_query(F.data == "pack_continue")
+async def pack_continue(cb: types.CallbackQuery, state: FSMContext):
+    await _render_picking(cb, state)
+
+
+# ===== СОЗДАНИЕ ДОКУМЕНТА (ПРОВЕДЕНИЕ) =====
+
+@router.callback_query(F.data == "pack_post")
+async def pack_post(cb: types.CallbackQuery, user: User, state: FSMContext):
+    data = await state.get_data()
+    cart: Dict[int, int] = data.get("cart", {})
+    if not cart:
+        return await cb.answer("Корзина пуста", show_alert=True)
+    wh_id = data["wh_id"]
+
+    async with get_session() as session:
+        number = await _next_pack_number(session, wh_id)
+        doc = PackDoc(number=number, warehouse_id=wh_id, user_id=user.id)
+        session.add(doc)
+        await session.flush()  # получаем doc.id
+
+        # позиции документа + движения
+        for pid, qty in cart.items():
+            session.add(PackDocItem(doc_id=doc.id, product_id=pid, qty=qty))
+            # raw -
+            session.add(StockMovement(
+                type=MovementType.upakovka, stage=ProductStage.raw, qty=-qty,
+                product_id=pid, warehouse_id=wh_id, doc_id=doc.id
+            ))
+            # packed +
+            session.add(StockMovement(
+                type=MovementType.upakovka, stage=ProductStage.packed, qty=qty,
+                product_id=pid, warehouse_id=wh_id, doc_id=doc.id
+            ))
+
+        # помечаем документ как проведённый
+        doc.status = "posted"
+        await session.commit()
+
+    await state.clear()
+    await send_content(cb, f"✅ Документ упаковки создан: *№{number}*.", parse_mode="Markdown")
+    await _show_doc(cb, doc_id=None, number=number)
+
+
+async def _show_doc(cb: types.CallbackQuery, doc_id: int | None = None, number: str | None = None):
+    """
+    Карточка документа упаковки
+    """
+    async with get_session() as session:
+        if doc_id:
+            doc = await session.get(PackDoc, doc_id)
+        else:
+            doc = (await session.execute(select(PackDoc).where(PackDoc.number == number))).scalar_one()
+        wh = await session.get(Warehouse, doc.warehouse_id)
+        items = (await session.execute(
+            select(PackDocItem, Product.name, Product.article)
+            .join(Product, Product.id == PackDocItem.product_id)
+            .where(PackDocItem.doc_id == doc.id)
+            .order_by(Product.article)
+        )).all()
+
+    total = sum(i.PackDocItem.qty for i in items)
+    lines = [
+        f"🏷 Документ упаковки *№{doc.number}* от {doc.created_at:%d.%m.%Y %H:%M}",
+        f"Склад: *{wh.name}*",
+        f"Статус: *{doc.status}*",
+        "",
+        "Состав:"
+    ]
+    for idx, row in enumerate(items, start=1):
+        it = row.PackDocItem
+        name, art = row.name, row.article
+        lines.append(f"{idx}) `{art or it.product_id}` — *{name}*: **{it.qty}** шт.")
+    lines += ["", f"📈 Итого: {len(items)} позиций, {total} шт."]
+
+    kb_rows = [[types.InlineKeyboardButton(text="⬅️ К списку документов", callback_data="pack_docs")]]
+    kb = types.InlineKeyboardMarkup(inline_keyboard=kb_rows)
+    await send_content(cb, "\n".join(lines), parse_mode="Markdown", reply_markup=kb)
+
+
+# ===== СПИСОК ДОКУМЕНТОВ =====
+
+@router.callback_query(F.data == "pack_docs")
+async def pack_docs(cb: types.CallbackQuery, state: FSMContext):
+    async with get_session() as session:
+        rows = (await session.execute(
+            select(
+                PackDoc.id, PackDoc.number, PackDoc.created_at, Warehouse.name,
+                func.coalesce(func.sum(PackDocItem.qty), 0).label("total")
             )
-            return
+            .join(Warehouse, Warehouse.id == PackDoc.warehouse_id)
+            .join(PackDocItem, PackDocItem.doc_id == PackDoc.id)
+            .group_by(PackDoc.id, Warehouse.name)
+            .order_by(desc(PackDoc.created_at))
+            .limit(20)
+        )).all()
 
-        doc_id = await _next_doc_id(s)
-        # две записи: RAW -qty, PACKED +qty
-        s.add(StockMovement(
-            warehouse_id=wh_id, product_id=pid,
-            qty=-qty, type=MovementType.upakovka, stage=ProductStage.raw,
-            user_id=user.id, doc_id=doc_id, comment="Упаковка"
-        ))
-        s.add(StockMovement(
-            warehouse_id=wh_id, product_id=pid,
-            qty=+qty, type=MovementType.upakovka, stage=ProductStage.packed,
-            user_id=user.id, doc_id=doc_id, comment="Упаковка"
-        ))
-        await s.commit()
+    if not rows:
+        kb = types.InlineKeyboardMarkup(
+            inline_keyboard=[[types.InlineKeyboardButton(text="⬅️ Назад", callback_data="pack_root")]]
+        )
+        return await send_content(cb, "Документов упаковки пока нет.", reply_markup=kb)
 
+    await send_content(cb, "Последние документы упаковки:", reply_markup=_kb_docs(rows))
+
+
+@router.callback_query(F.data.startswith("pack_doc:"))
+async def pack_doc_open(cb: types.CallbackQuery, state: FSMContext):
+    did = int(cb.data.split(":")[1])
+    await _show_doc(cb, doc_id=did)
+
+
+# ===== НАВИГАЦИЯ =====
+
+@router.callback_query(F.data == "pack_back_wh")
+async def pack_back_wh(cb: types.CallbackQuery, state: FSMContext):
+    # заново начало флоу выбора склада
+    await pack_new(cb, user=None, state=state)  # user в pack_new не используется
+
+
+# Локальный обработчик «Назад» для упаковки
+@router.callback_query(F.data == "back_to_packing")
+async def back_to_packing(cb: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await call.message.edit_text(
-        "✅ Упаковка проведена.\n"
-        f"Документ #{doc_id}: RAW −{qty}, PACKED +{qty}.\n"
-        "Можно продолжать через главное меню."
-    )
-
-@router.callback_query(F.data == "pack:cancel")
-async def cancel(call: types.CallbackQuery, state: FSMContext):
-    await state.clear()
-    await call.message.edit_text("Отменено.")
-
-# Совместимость с текущим bot.py (регистрация как раньше)
-def register_packing_handlers(dp: Dispatcher):
-    dp.include_router(router)
+    try:
+        await cb.message.edit_reply_markup()
+    except Exception:
+        pass
+    await cb.message.answer("Раздел «Упаковка». Выберите действие:", reply_markup=back_inline_kb("back_to_menu"))
+    await cb.answer()

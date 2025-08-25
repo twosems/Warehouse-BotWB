@@ -1,9 +1,9 @@
 # keyboards/inline.py
-from typing import List, Optional
+from typing import List, Optional, Dict
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from database.models import Warehouse, Product
-from utils.pagination import build_pagination_keyboard
+from utils.pagination import build_pagination_keyboard  # ожидаем: -> List[InlineKeyboardButton]
 
 
 def confirm_kb(prefix: str = "rcv") -> InlineKeyboardMarkup:
@@ -20,22 +20,33 @@ def confirm_kb(prefix: str = "rcv") -> InlineKeyboardMarkup:
 def warehouses_kb(
         warehouses: List[Warehouse],
         prefix: str = "rcv_wh",
+        priorities_by_id: Optional[Dict[int, int]] = None,
+        priorities_by_name: Optional[Dict[str, int]] = None,
+        show_menu_back: bool = True,
 ) -> InlineKeyboardMarkup:
     """
-    Список складов (СПб и Томск — первыми), плюс кнопка «Назад к меню».
+    Список складов. По умолчанию — без спец-сортировки.
+    Можно задать:
+      - priorities_by_id={warehouse_id: priority}
+      - priorities_by_name={"Санкт-Петербург": 0, "Томск": 1}
     callback_data: <prefix>:<id>
-      - для Receiving используйте prefix="rcv_wh"
-      - для Stocks/Reports — свой (например, "pr_wh", "rep_wh")
     """
-    order = {"Санкт-Петербург": 0, "Томск": 1}
-    warehouses_sorted = sorted(warehouses, key=lambda w: order.get(w.name, 99))
+    def prio(w: Warehouse) -> int:
+        if priorities_by_id and w.id in priorities_by_id:
+            return priorities_by_id[w.id]
+        if priorities_by_name and w.name in priorities_by_name:
+            return priorities_by_name[w.name]
+        return 9999
+
+    warehouses_sorted = sorted(warehouses, key=prio)
 
     rows: List[List[InlineKeyboardButton]] = []
     for w in warehouses_sorted:
-        label = ("🏙️ " if w.name == "Санкт-Петербург" else "🏔️ " if w.name == "Томск" else "") + w.name
+        label = w.name
         rows.append([InlineKeyboardButton(text=label, callback_data=f"{prefix}:{w.id}")])
 
-    rows.append([InlineKeyboardButton(text="⬅️ Назад к меню", callback_data="back_to_menu")])
+    if show_menu_back:
+        rows.append([InlineKeyboardButton(text="⬅️ Назад к меню", callback_data="back_to_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -47,25 +58,28 @@ def products_page_kb(
         back_to: Optional[str] = None,
         item_prefix: str = "rcv_prod",
         page_prefix: str = "rcv_prod_page",
+        show_cancel: bool = False,
+        cancel_to: str = "cancel",
+        trim_len: int = 48,
 ) -> InlineKeyboardMarkup:
     """
     Список товаров с пагинацией.
     callback_data:
-      - <item_prefix>:<product_id>   (по умолчанию rcv_prod:<id>)
-      - <page_prefix>:<page>         (по умолчанию rcv_prod_page:<n>)
+      - <item_prefix>:<product_id>
+      - <page_prefix>:<page>
       - back_to (например, rcv_back_wh / stocks_back_wh / reports_back)
-    Для отчётов укажите, например: item_prefix="report_art", page_prefix="report_art_page".
     """
     rows: List[List[InlineKeyboardButton]] = []
 
-    # Кнопки товаров
-    for p in products:
-        rows.append([InlineKeyboardButton(
-            text=f"{p.name} (арт. {p.article})",
-            callback_data=f"{item_prefix}:{p.id}"
-        )])
+    def short_text(name: str) -> str:
+        return name if len(name) <= trim_len else (name[:trim_len - 1] + "…")
 
-    # Пагинация
+    for p in products:
+        title = short_text(p.name or f"ID {p.id}")
+        art = f" (арт. {p.article})" if getattr(p, "article", None) else ""
+        rows.append([InlineKeyboardButton(text=f"{title}{art}", callback_data=f"{item_prefix}:{p.id}")])
+
+    # Пагинация — ожидаем, что build_pagination_keyboard вернёт одну строку кнопок
     pag_row = build_pagination_keyboard(
         page=page,
         page_size=page_size,
@@ -73,14 +87,19 @@ def products_page_kb(
         prev_cb_prefix=page_prefix,
         next_cb_prefix=page_prefix,
         prev_text="◀ Предыдущая",
-        next_text="Следующая ▶"
+        next_text="Следующая ▶",
+        # Если библиотека поддерживает no-op, можно пробросить:
+        # noop_cb="noop"
     )
     if pag_row:
         rows.append(pag_row)
 
-    # Назад (если задано, иначе назад к меню)
+    # Назад / Отмена
     if back_to:
-        rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=back_to)])
+        last_row: List[InlineKeyboardButton] = [InlineKeyboardButton(text="⬅️ Назад", callback_data=back_to)]
+        if show_cancel:
+            last_row.append(InlineKeyboardButton(text="❌ Отмена", callback_data=cancel_to))
+        rows.append(last_row)
     else:
         rows.append([InlineKeyboardButton(text="⬅️ Назад к меню", callback_data="back_to_menu")])
 
@@ -101,7 +120,11 @@ def qty_kb(back_to: str, cancel_to: Optional[str] = None) -> InlineKeyboardMarku
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def comment_kb(back_to: str, cancel_to: Optional[str] = None, skip_cb: str = "rcv_skip_comment") -> InlineKeyboardMarkup:
+def comment_kb(
+        back_to: str,
+        cancel_to: Optional[str] = None,
+        skip_cb: str = "rcv_skip_comment"
+) -> InlineKeyboardMarkup:
     """
     Клавиатура для комментария (Пропустить / Назад / (опц.) Отмена).
     skip_cb: callback_data для «Пропустить комментарий»
