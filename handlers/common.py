@@ -1,67 +1,43 @@
 # handlers/common.py
 import contextlib
 import logging
+from types import SimpleNamespace
 from typing import Dict, Optional
 
-from aiogram import Dispatcher, types, BaseMiddleware, Bot
+from aiogram import Dispatcher, types, BaseMiddleware, Bot, Router, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select
 
 from config import ADMIN_TELEGRAM_ID
 from keyboards.main_menu import get_main_menu
-from database.db import get_session, set_audit_user
+from database.db import get_session, set_audit_user, init_db
 from database.models import User, UserRole
 
-# Память процесса
+# Память процесса (локально в процессе бота)
 pending_requests: Dict[int, str] = {}
 last_content_msg: Dict[int, int] = {}
 
 
-class RoleCheckMiddleware(BaseMiddleware):
-    """
-    Пускаем всех на /start. Для остальных сообщений/колбэков — только авторизованных.
-    В data прокидываем current User (database.models.User).
-    Также отмечаем текущего пользователя для аудита (set_audit_user).
-    """
-    async def __call__(self, handler, event, data: dict):
-        # /start пропускаем без проверки авторизации
-        if isinstance(event, types.Message) and event.text and event.text.startswith("/start"):
-            # На всякий случай сбросим текущего аудит-пользователя — в /start могут не быть в системе
-            set_audit_user(None)
-            return await handler(event, data)
-
-        # Все остальные апдейты: Message / CallbackQuery
-        if isinstance(event, (types.Message, types.CallbackQuery)):
-            user_id = event.from_user.id
-            async with get_session() as session:
-                res = await session.execute(select(User).where(User.telegram_id == user_id))
-                user: Optional[User] = res.scalar()
-
-            if not user:
-                # никто не авторизован -> сбрасываем user_id для аудита
-                set_audit_user(None)
-                text = "Пожалуйста, авторизуйтесь через /start."
-                if isinstance(event, types.Message):
-                    await event.answer(text)
-                else:
-                    await event.message.answer(text)
-                return
-
-            # Авторизованы: сохраняем в контекст обработчика и выставляем user_id для аудита
-            data["user"] = user
-            set_audit_user(user.id)
-            return await handler(event, data)
-
-        # На прочие типы событий просто сбросим user_id
-        set_audit_user(None)
-        return await handler(event, data)
+# ---------------------------
+# UI helpers
+# ---------------------------
+def _kb_emergency_root() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💾 Бэкапы / Восстановление", callback_data="admin:backup")],
+        [InlineKeyboardButton(text="Закрыть", callback_data="noop")],
+    ])
 
 
-async def send_content(cb: types.CallbackQuery, text: str, reply_markup=None, parse_mode: Optional[str] = None):
+async def send_content(
+        cb: types.CallbackQuery,
+        text: str,
+        reply_markup: Optional[InlineKeyboardMarkup] = None,
+        parse_mode: Optional[str] = None,
+):
     """
     Удаляем прошлый контент и отправляем новый текст отдельным сообщением — ниже клавиатуры.
-    parse_mode опционален (Markdown/HTML).
     """
     uid = cb.from_user.id
     mid = last_content_msg.get(uid)
@@ -77,40 +53,166 @@ async def send_content(cb: types.CallbackQuery, text: str, reply_markup=None, pa
     last_content_msg[uid] = m.message_id
 
 
-# ===== /start: заявка админу или меню =====
+def _is_emergency_allowed(event: types.TelegramObject) -> bool:
+    """
+    В аварийном режиме (нет БД/нет записи admin) разрешаем только:
+      • экран бэкапов (admin:backup)
+      • все шаги восстановления/бэкапа (bk:*)
+      • любые сообщения (нужны для отправки файла и подтверждения фразы)
+    """
+    if isinstance(event, types.CallbackQuery):
+        data = event.data or ""
+        return data == "admin:backup" or data.startswith("bk:")
+    if isinstance(event, types.Message):
+        return True
+    return False
+
+
+# ---------------------------
+# Middleware с аварийным режимом
+# ---------------------------
+class RoleCheckMiddleware(BaseMiddleware):
+    """
+    /start — пропускаем всем.
+
+    Остальные события:
+      • если пользователь найден в БД — обычный режим;
+      • если пользователь не найден и это ADMIN_TELEGRAM_ID —
+          включаем аварийный режим: пропускаем ТОЛЬКО бэкапы/restore;
+      • не админ — просим /start, либо сообщаем, что БД недоступна.
+    """
+    async def __call__(self, handler, event, data: dict):
+        # /start — всегда можно
+        if isinstance(event, types.Message) and event.text and event.text.startswith("/start"):
+            set_audit_user(None)
+            return await handler(event, data)
+
+        # Обрабатываем только Message/CallbackQuery
+        if not isinstance(event, (types.Message, types.CallbackQuery)):
+            set_audit_user(None)
+            return await handler(event, data)
+
+        user_id = event.from_user.id
+
+        # Пробуем найти пользователя в БД (если БД доступна)
+        user: Optional[User] = None
+        db_ok = True
+        try:
+            async with get_session() as session:
+                res = await session.execute(select(User).where(User.telegram_id == user_id))
+                user = res.scalar()
+        except Exception:
+            db_ok = False
+            user = None
+
+        # Нашёлся пользователь — обычный режим
+        if user is not None:
+            data["user"] = user
+            set_audit_user(user.id)
+            return await handler(event, data)
+
+        # Нет пользователя: если это админ — аварийный режим (только бэкапы)
+        if user_id == ADMIN_TELEGRAM_ID:
+            fallback_admin = SimpleNamespace(
+                id=None, telegram_id=user_id, name="Emergency Admin", role=UserRole.admin
+            )
+            data["user"] = fallback_admin
+            data["emergency"] = True
+            set_audit_user(None)
+
+            if _is_emergency_allowed(event):
+                return await handler(event, data)
+            else:
+                msg = "Аварийный режим: доступны только действия «Бэкапы/Восстановление». Откройте экран бэкапов."
+                if isinstance(event, types.Message):
+                    await event.answer(msg, reply_markup=_kb_emergency_root())
+                else:
+                    await event.message.answer(msg, reply_markup=_kb_emergency_root())
+                return
+
+        # Не админ: либо БД недоступна, либо нет записи — просим /start
+        set_audit_user(None)
+        text = "База данных недоступна. Повторите позже." if not db_ok else "Пожалуйста, авторизуйтесь через /start."
+        if isinstance(event, types.Message):
+            await event.answer(text)
+        else:
+            await event.message.answer(text)
+        return
+
+
+# ---------------------------
+# /start: с безопасным бутстрапом админа
+# ---------------------------
 async def cmd_start(message: types.Message, bot: Bot):
     user_id = message.from_user.id
-    async with get_session() as session:
-        res = await session.execute(select(User).where(User.telegram_id == user_id))
-        user = res.scalar()
+
+    # 1) Админ: пытаемся поднять схему и самозавести запись админа.
+    if user_id == ADMIN_TELEGRAM_ID:
+        try:
+            # если таблиц нет — создаст
+            await init_db()
+        except Exception:
+            pass
+
+        try:
+            async with get_session() as session:
+                res = await session.execute(select(User).where(User.telegram_id == user_id))
+                admin_user = res.scalar()
+                if not admin_user:
+                    admin_user = User(
+                        telegram_id=user_id,
+                        name=message.from_user.full_name or "Admin",
+                        role=UserRole.admin,
+                        password_hash="bootstrap",
+                    )
+                    session.add(admin_user)
+                    await session.commit()
+
+            set_audit_user(admin_user.id)
+            await message.answer("Главное меню:", reply_markup=await get_main_menu(UserRole.admin))
+            return
+
+        except Exception:
+            # Схема/БД не доступна — показываем аварийное меню
+            set_audit_user(None)
+            await message.answer(
+                "Аварийный режим: база недоступна. Доступны только «Бэкапы/Восстановление».",
+                reply_markup=_kb_emergency_root(),
+            )
+            return
+
+    # 2) Обычный пользователь
+    try:
+        async with get_session() as session:
+            res = await session.execute(select(User).where(User.telegram_id == user_id))
+            user = res.scalar()
+    except Exception:
+        user = None
 
     if user:
-        # Пользователь авторизован — можно выставить аудит-пользователя здесь тоже (на случай действий в /start)
         set_audit_user(user.id)
-        # меню теперь асинхронное и принимает enum UserRole
         await message.answer("Главное меню:", reply_markup=await get_main_menu(user.role))
         return
 
-    # Заявка админу (неавторизован)
+    # Заявка админу
     set_audit_user(None)
     pending_requests[user_id] = message.from_user.full_name or str(user_id)
-    kb = types.InlineKeyboardMarkup(inline_keyboard=[[
-        types.InlineKeyboardButton(text="✅ Принять",  callback_data=f"approve:{user_id}"),
-        types.InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{user_id}"),
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Принять",  callback_data=f"approve:{user_id}"),
+        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"reject:{user_id}"),
     ]])
-    try:
+    with contextlib.suppress(Exception):
         await bot.send_message(
             ADMIN_TELEGRAM_ID,
             f"Пользователь {message.from_user.full_name} (@{message.from_user.username or 'без username'}) запросил доступ.",
             reply_markup=kb,
         )
-    except Exception as e:
-        logging.exception("Не удалось отправить запрос админу: %s", e)
-
     await message.answer("Ваш запрос отправлен администратору. Ожидайте одобрения.")
 
 
-# Решение админа по заявке (approve/reject)
+# ---------------------------
+# Approve / Reject
+# ---------------------------
 async def handle_admin_decision(cb: types.CallbackQuery, bot: Bot):
     try:
         action, uid_str = cb.data.split(":")
@@ -127,6 +229,10 @@ async def handle_admin_decision(cb: types.CallbackQuery, bot: Bot):
         return
 
     if action == "approve":
+        # На случай wipe — поднимем схему и сохраним пользователя
+        with contextlib.suppress(Exception):
+            await init_db()
+
         async with get_session() as session:
             new_user = User(
                 telegram_id=uid,
@@ -147,7 +253,9 @@ async def handle_admin_decision(cb: types.CallbackQuery, bot: Bot):
     pending_requests.pop(uid, None)
 
 
-# Базовые разделы-заглушки (если где-то ещё используются)
+# ---------------------------
+# Разделы-заглушки (если где-то используются)
+# ---------------------------
 async def on_ostatki(cb: types.CallbackQuery, user: User):
     await cb.answer()
     await send_content(cb, "«Остатки»: модуль в разработке.")
@@ -166,35 +274,38 @@ async def on_postavki(cb: types.CallbackQuery, user: User):
 
 async def on_otchety(cb: types.CallbackQuery, user: User):
     await cb.answer()
-    await send_content(cb, "«Отчеты»: модуль в разработке.")
+    await send_content(cb, "«Отчёты»: модуль в разработке.")
 
 async def back_to_main_menu(cb: types.CallbackQuery, user: User, state: FSMContext):
     await cb.answer()
     if state:
         await state.clear()
-    # здесь тоже асинхронный вызов
     await cb.message.answer("Главное меню:", reply_markup=await get_main_menu(user.role))
 
-# handlers/common.py (фрагмент в конце файла)
-from aiogram import Router, types, F
 
+# ---------------------------
+# NOOP router (закрыть "часики")
+# ---------------------------
 noop_router = Router()
 
 @noop_router.callback_query(F.data == "noop")
 async def noop_cb(cb: types.CallbackQuery):
-    # просто закрываем "часики" у кнопки; действий не требуется
     await cb.answer()
 
 
-# в функции регистрации роутеров/в bot.py обязательно подключи ПОСЛЕДНИМ:
-# dp.include_router(noop_router)
-
+# ---------------------------
+# Register
+# ---------------------------
 def register_common_handlers(dp: Dispatcher):
     dp.message.register(cmd_start, CommandStart())
     dp.callback_query.register(handle_admin_decision, lambda c: c.data.startswith(("approve:", "reject:")))
-    dp.callback_query.register(on_ostatki, lambda c: c.data == "ostatki")
-    dp.callback_query.register(on_prihod,  lambda c: c.data == "prihod")
+
+    dp.callback_query.register(on_ostatki,  lambda c: c.data == "ostatki")
+    dp.callback_query.register(on_prihod,   lambda c: c.data == "prihod")
     dp.callback_query.register(on_korr_ost, lambda c: c.data == "korr_ost")
     dp.callback_query.register(on_postavki, lambda c: c.data == "postavki")
     dp.callback_query.register(on_otchety,  lambda c: c.data == "otchety")
     dp.callback_query.register(back_to_main_menu, lambda c: c.data == "back_to_menu")
+
+    # Подключаем noop ПОСЛЕДНИМ
+    dp.include_router(noop_router)

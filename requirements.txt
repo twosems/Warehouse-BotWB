@@ -4,3 +4,7 @@ asyncpg==0.30.0
 python-dotenv==1.0.1
 bcrypt==4.2.0
 greenlet==3.2.3
+apscheduler==3.10.4
+google-api-python-client==2.143.0
+google-auth==2.34.0
+google-auth-httplib2==0.2.0

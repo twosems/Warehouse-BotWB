@@ -1,14 +1,12 @@
 # handlers/admin.py
 import logging
 from typing import Optional, List, Tuple
-import os  # для os.path.basename в отчёте
+
 from aiogram import types, Dispatcher, Bot
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select, func, update, desc
-from sqlalchemy.orm import aliased
-from sqlalchemy.sql import and_
 
 from database.db import get_session
 from database.models import (
@@ -24,7 +22,6 @@ from database.menu_visibility import (
     toggle_menu_visibility,
 )
 from handlers.common import send_content
-
 
 # =========================
 #          FSM
@@ -59,7 +56,9 @@ def kb_admin_root() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📦 Товары", callback_data="admin_prod")],
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
         [InlineKeyboardButton(text="🧾 Журнал действий", callback_data="admin_audit")],
-        [InlineKeyboardButton(text="💾 Бэкап БД (сейчас)", callback_data="admin_backup_now")],  # ← НОВОЕ
+        [InlineKeyboardButton(text="💾 Бэкапы", callback_data="admin:backup")],
+        # Кнопка экстренного восстановления — работает даже при падении БД
+        [InlineKeyboardButton(text="🆘 Emergency Restore", callback_data="bk:restore_emergency")],
         [InlineKeyboardButton(text="🧩 Настройки меню", callback_data="adm_menu_roles")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")],
     ])
@@ -112,7 +111,7 @@ def kb_prod_pick(products: List[Product]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"{p.name} (арт. {p.article}) {'✅' if p.is_active else '🚫'}", callback_data=f"adm_prod_pick:{p.id}")]
         for p in products
     ])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_prod")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_product_edit")])
     return kb
 
 def kb_prod_actions(p: Product) -> InlineKeyboardMarkup:
@@ -390,7 +389,6 @@ async def admin_wh_add_apply(message: types.Message, user: User, state: FSMConte
     if not name:
         await message.answer("Название пустое. Введите ещё раз:"); return
     async with get_session() as session:
-        # Проверка уникальности
         exists = (await session.execute(select(Warehouse).where(Warehouse.name == name))).scalar()
         if exists:
             await message.answer("Склад с таким названием уже существует. Введите другое имя:"); return
@@ -449,7 +447,6 @@ async def admin_wh_rename_apply(message: types.Message, user: User, state: FSMCo
     if not name:
         await message.answer("Название пустое. Введите ещё раз:"); return
     async with get_session() as session:
-        # Проверка уникальности
         exists = (await session.execute(select(Warehouse).where(Warehouse.name == name, Warehouse.id != wh_id))).scalar()
         if exists:
             await message.answer("Склад с таким названием уже существует. Введите другое имя:"); return
@@ -485,7 +482,6 @@ async def admin_wh_del(cb: types.CallbackQuery, user: User, state: FSMContext):
     except Exception:
         await cb.answer("Некорректные данные.", show_alert=True); return
 
-    # Проверим связи
     async with get_session() as session:
         sm_count = (await session.execute(
             select(func.count()).select_from(StockMovement).where(StockMovement.warehouse_id == wh_id)
@@ -657,7 +653,6 @@ async def admin_prod_del(cb: types.CallbackQuery, user: User, state: FSMContext)
     except Exception:
         await cb.answer("Некорректные данные.", show_alert=True); return
 
-    # Проверим связи
     async with get_session() as session:
         mv_count = (await session.execute(
             select(func.count()).select_from(StockMovement).where(StockMovement.product_id == pid)
@@ -699,7 +694,6 @@ AUDIT_PAGE = 10
 def _format_audit_row(row: Tuple[AuditLog, Optional[User]]) -> str:
     log, usr = row
     who = f"{usr.name} (id={usr.id})" if usr else "system"
-    # Без Markdown, чтобы не ловить ошибки парсинга
     parts = [
         f"[{log.created_at}]",
         f"user: {who}",
@@ -707,7 +701,6 @@ def _format_audit_row(row: Tuple[AuditLog, Optional[User]]) -> str:
         f"table: {log.table_name}",
         f"pk: {log.record_pk}",
     ]
-    # Коротко покажем diff/old/new, если есть
     if log.diff:
         parts.append(f"diff: {str(log.diff)[:200]}")
     elif log.new_data and not log.old_data:
@@ -721,11 +714,8 @@ async def admin_audit_root(cb: types.CallbackQuery, user: User, state: FSMContex
         await cb.answer("Доступ запрещен.", show_alert=True); return
     await cb.answer()
 
-    # Пагинация: считаем общее количество
     async with get_session() as session:
         total = (await session.execute(select(func.count()).select_from(AuditLog))).scalar_one()
-
-        # Выборка с джойном на пользователя (LEFT OUTER)
         res = await session.execute(
             select(AuditLog, User)
             .join(User, User.id == AuditLog.user_id, isouter=True)
@@ -739,10 +729,9 @@ async def admin_audit_root(cb: types.CallbackQuery, user: User, state: FSMContex
         await send_content(cb, "Журнал пуст.", reply_markup=kb_admin_root())
         return
 
-    lines = [ _format_audit_row(r) for r in rows ]
+    lines = [_format_audit_row(r) for r in rows]
     text = "Журнал действий (последние записи):\n\n" + "\n".join(lines)
 
-    # Пагинация кнопками
     buttons = []
     if page > 1:
         buttons.append(InlineKeyboardButton(text="◀ Предыдущая", callback_data=f"admin_audit_page:{page-1}"))
@@ -775,11 +764,8 @@ async def admin_menu_roles_root(cb: types.CallbackQuery, user: User, state: FSMC
     if user.role != UserRole.admin:
         await cb.answer("Доступ запрещен.", show_alert=True); return
     await cb.answer()
-
-    # гарантируем, что таблица настроек заполнена дефолтами
     async with get_session() as session:
         await ensure_menu_visibility_defaults(session)
-
     await send_content(cb, "Выберите роль для настройки видимости меню:", reply_markup=kb_menu_roles_root())
 
 async def admin_menu_role(cb: types.CallbackQuery, user: User, state: FSMContext):
@@ -792,39 +778,12 @@ async def admin_menu_role(cb: types.CallbackQuery, user: User, state: FSMContext
     except Exception:
         await cb.answer("Некорректные данные.", show_alert=True); return
 
-    # соберём текущую карту видимости
     async with get_session() as session:
         res = await session.execute(select(RoleMenuVisibility).where(RoleMenuVisibility.role == role))
         rows = res.scalars().all()
     state_map = {r.item.value: r.visible for r in rows}
     await send_content(cb, f"Настройки меню для роли {role.value}:",
                        reply_markup=kb_menu_visibility(role, state_map))
-# ===== БЭКАП БД =====
-async def admin_backup_now(cb: types.CallbackQuery, user: User, state: FSMContext):
-    if user.role != UserRole.admin:
-        await cb.answer("Доступ запрещен.", show_alert=True); return
-    await cb.answer()
-
-    from utils.backup import make_backup_and_maybe_upload
-
-    try:
-        info = make_backup_and_maybe_upload()
-    except FileNotFoundError as e:
-        await send_content(cb, f"❌ Не найден pg_dump или credentials: {e}", reply_markup=kb_admin_root()); return
-    except Exception as e:
-        await send_content(cb, f"❌ Ошибка бэкапа: {e}", reply_markup=kb_admin_root()); return
-
-    size_mb = round(info["size"] / 1024 / 1024, 2)
-    text = (
-        "✅ Бэкап создан.\n\n"
-        f"Файл: {os.path.basename(info['local_path'])}\n"
-        f"Размер: {size_mb} МБ\n"
-        f"Локально: {info['local_path']}\n"
-    )
-    if info["drive_file_id"]:
-        text += f"Google Drive: {info['drive_link'] or '(ссылка недоступна)'}\n"
-    await send_content(cb, text, reply_markup=kb_admin_root())
-
 
 async def admin_menu_toggle(cb: types.CallbackQuery, user: User, state: FSMContext):
     if user.role != UserRole.admin:
@@ -839,8 +798,6 @@ async def admin_menu_toggle(cb: types.CallbackQuery, user: User, state: FSMConte
 
     async with get_session() as session:
         new_flag = await toggle_menu_visibility(session, role, item)
-
-        # Обновим экран роли
         res = await session.execute(select(RoleMenuVisibility).where(RoleMenuVisibility.role == role))
         rows = res.scalars().all()
 
@@ -853,7 +810,6 @@ async def admin_menu_toggle(cb: types.CallbackQuery, user: User, state: FSMConte
 #     REGISTER ROUTES
 # =========================
 def register_admin_handlers(dp: Dispatcher):
-    # Корень
     dp.callback_query.register(on_admin,                   lambda c: c.data == "admin")
 
     # Пользователи
@@ -906,4 +862,3 @@ def register_admin_handlers(dp: Dispatcher):
     dp.callback_query.register(admin_menu_roles_root,      lambda c: c.data == "adm_menu_roles")
     dp.callback_query.register(admin_menu_role,            lambda c: c.data.startswith("adm_menu_role:"))
     dp.callback_query.register(admin_menu_toggle,          lambda c: c.data.startswith("adm_menu_toggle:"))
-    dp.callback_query.register(admin_backup_now,           lambda c: c.data == "admin_backup_now")

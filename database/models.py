@@ -316,3 +316,21 @@ class MskInboundItem(Base):
 
     doc: Mapped["MskInboundDoc"] = relationship(back_populates="items")
     product: Mapped["Product"] = relationship()
+# ... существующие импорты ...
+class BackupFrequency(enum.Enum):
+    daily = "daily"
+    weekly = "weekly"
+    monthly = "monthly"
+
+class BackupSettings(Base):
+    __tablename__ = "backup_settings"
+    id = Column(Integer, primary_key=True, default=1)
+    enabled = Column(Boolean, nullable=False, default=False)
+    frequency = Column(Enum(BackupFrequency, name="backup_frequency_enum"), nullable=False, default=BackupFrequency.daily)
+    time_hour = Column(Integer, nullable=False, default=3)
+    time_minute = Column(Integer, nullable=False, default=15)
+    retention_days = Column(Integer, nullable=False, default=30)
+    gdrive_folder_id = Column(String(128))
+    gdrive_sa_json = Column(JSONB)          # сам JSON сервис-аккаунта
+    last_run_at = Column(TIMESTAMP)
+    last_status = Column(String(255))
