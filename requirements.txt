@@ -8,3 +8,4 @@ apscheduler==3.10.4
 google-api-python-client==2.143.0
 google-auth==2.34.0
 google-auth-httplib2==0.2.0
+alembic==1.13.2
