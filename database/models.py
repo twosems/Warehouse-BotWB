@@ -182,10 +182,14 @@ class PackDoc(Base):
     __tablename__ = "pack_docs"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    number: Mapped[str]
+    number: Mapped[str] = mapped_column(String(32))
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     warehouse_id: Mapped[int] = mapped_column(ForeignKey("warehouses.id"))
     user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))
+
+    # Новая колонка
+    notes: Mapped[Optional[str]] = mapped_column(String(255))
+
     # В БД уже существует ENUM packdocstatus ('draft','posted').
     # Чтобы Alembic не пытался переименовывать тип, явно указываем имя и запрещаем создание типа.
     status: Mapped[PackDocStatus] = mapped_column(
@@ -198,11 +202,13 @@ class PackDoc(Base):
         default=PackDocStatus.draft,
         nullable=False
     )
-    comment: Mapped[Optional[str]]
+
+    comment: Mapped[Optional[str]] = mapped_column(String(255))
 
     warehouse: Mapped["Warehouse"] = relationship()
     items: Mapped[List["PackDocItem"]] = relationship(
-        back_populates="doc", cascade="all, delete-orphan"
+        back_populates="doc",
+        cascade="all, delete-orphan"
     )
 
 
