@@ -8,3 +8,21 @@ venv/
 # Python cache
 __pycache__/
 *.py[cod]
+# secrets
+.env
+*.env
+token.json
+client_secret.json
+credentials*.json
+credentials.json
+credentials-sa.json
+
+# google oauth/service tokens & caches
+**/token.json
+**/.credentials/
+
+# backups/dumps
+/backups/
+*.sql
+*.sql.gz
+*.backup
