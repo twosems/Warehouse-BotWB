@@ -186,6 +186,7 @@ class PackDoc(Base):
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     warehouse_id: Mapped[int] = mapped_column(ForeignKey("warehouses.id"))
     user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))
+    notes: Mapped[Optional[str]] = mapped_column(String(255))
     # В БД уже существует ENUM packdocstatus ('draft','posted').
     # Чтобы Alembic не пытался переименовывать тип, явно указываем имя и запрещаем создание типа.
     status: Mapped[PackDocStatus] = mapped_column(
