@@ -9,6 +9,7 @@ from sqlalchemy import (
     Column, Integer, String, Enum, BigInteger, TIMESTAMP, Boolean,
     ForeignKey, UniqueConstraint, Numeric, DateTime,
 )
+from sqlalchemy import Enum as SAEnum
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import relationship, Mapped, mapped_column
@@ -185,9 +186,17 @@ class PackDoc(Base):
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow)
     warehouse_id: Mapped[int] = mapped_column(ForeignKey("warehouses.id"))
     user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))
+    # В БД уже существует ENUM packdocstatus ('draft','posted').
+    # Чтобы Alembic не пытался переименовывать тип, явно указываем имя и запрещаем создание типа.
     status: Mapped[PackDocStatus] = mapped_column(
-        Enum(PackDocStatus, name="pack_doc_status_enum"),
-        default=PackDocStatus.draft
+        SAEnum(
+            PackDocStatus,
+            name="packdocstatus",
+            create_type=False,   # не создавать тип заново
+            native_enum=True
+        ),
+        default=PackDocStatus.draft,
+        nullable=False
     )
     comment: Mapped[Optional[str]]
 
@@ -316,11 +325,15 @@ class MskInboundItem(Base):
 
     doc: Mapped["MskInboundDoc"] = relationship(back_populates="items")
     product: Mapped["Product"] = relationship()
-# ... существующие импорты ...
+
+
+# ===== Настройки бэкапов =====
+
 class BackupFrequency(enum.Enum):
     daily = "daily"
     weekly = "weekly"
     monthly = "monthly"
+
 
 class BackupSettings(Base):
     __tablename__ = "backup_settings"
