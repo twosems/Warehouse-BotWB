@@ -19,6 +19,18 @@ LABELS: Dict[MenuItem, str] = {
 
     MenuItem.admin:         "⚙️ Администрирование",
 }
+# Короткие описания пунктов меню (единая точка правды)
+DESCRIPTIONS: Dict[MenuItem, str] = {
+    MenuItem.stocks:        "Показать текущие остатки по складам и товарам.",
+    MenuItem.receiving:     "Оформить приход товара на выбранный склад.",
+    MenuItem.supplies:      "Сформировать поставку на склады маркетплейса.",
+    MenuItem.packing:       "Подготовить и упаковать позиции к поставке.",
+    MenuItem.picking:       "Скомплектовать товары перед упаковкой/поставкой.",
+    MenuItem.reports:       "Сформировать отчёты по остаткам, движениям и истории.",
+    MenuItem.purchase_cn:   "Учёт закупок/поступлений из Китая (CN).",
+    MenuItem.msk_warehouse: "Операции и движения на московский склад.",
+    MenuItem.admin:         "Администрирование: пользователи, склады, настройки.",
+}
 
 MENU_ORDER: List[MenuItem] = [
     MenuItem.stocks,

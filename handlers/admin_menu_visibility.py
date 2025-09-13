@@ -14,6 +14,18 @@ from database.menu_visibility import (
 )
 
 router = Router()
+# Короткие описания пунктов меню (единая точка правды)
+DESCRIPTIONS = {
+    MenuItem.stocks:        "Показать текущие остатки по складам и товарам.",
+    MenuItem.receiving:     "Оформить приход товара на выбранный склад.",
+    MenuItem.supplies:      "Сформировать поставку на склады маркетплейса.",
+    MenuItem.packing:       "Подготовить и упаковать позиции к поставке.",
+    MenuItem.picking:       "Скомплектовать товары перед упаковкой/поставкой.",
+    MenuItem.reports:       "Сформировать отчёты по остаткам, движениям и истории.",
+    MenuItem.purchase_cn:   "Учёт закупок/поступлений из Китая (CN).",
+    MenuItem.msk_warehouse: "Операции и движения на московский склад.",
+    MenuItem.admin:         "Администрирование: пользователи, склады, настройки.",
+}
 
 
 def _kb_visibility(role: UserRole, vis_map: dict[MenuItem, bool]) -> InlineKeyboardMarkup:

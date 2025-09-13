@@ -16,6 +16,7 @@ from handlers.manager import router as manager_router
 from handlers.packing import router as packing_router
 from handlers.cn_purchase import router as cn_router
 from handlers.msk_inbound import router as msk_router
+from handlers.menu_info import router as menu_info_router
 
 # === Бэкапы ===
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
@@ -72,6 +73,7 @@ async def main():
     dp.include_router(manager_router)
     dp.include_router(cn_router)
     dp.include_router(msk_router)
+    dp.include_router(menu_info_router)
 
     register_reports_handlers(dp)
     register_common_handlers(dp)  # общий — ПОСЛЕДНИМ

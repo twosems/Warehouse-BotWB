@@ -15,9 +15,16 @@ from keyboards.main_menu import (
     get_main_menu,
     get_procure_submenu,
     get_pack_submenu,
+    # Для текстов и групп — чтобы строить описания под заголовком
+    TEXTS, PROCURE_GROUP, PACK_GROUP,
 )
 from database.db import get_session, set_audit_user, init_db
 from database.models import User, UserRole
+
+# ➕ добавляем функции и описания для пунктов меню
+from database.menu_visibility import get_visible_menu_items_for_role
+from database import menu_visibility as mv
+
 
 # Память процесса (локально в процессе бота)
 pending_requests: Dict[int, str] = {}
@@ -289,22 +296,56 @@ async def back_to_main_menu(cb: types.CallbackQuery, user: User, state: FSMConte
 
 
 # ---------------------------
-# Навигация по корневым категориям (новое)
+# Навигация по корневым категориям (с описаниями)
 # ---------------------------
 async def show_root_menu(cb: types.CallbackQuery, user: User):
-    """Корневое меню: 2 категории + Отчёты + Администрирование (если разрешены)."""
+    """Корневое меню: 2 категории + Отчёты + Администрирование (если разрешены) с описаниями."""
     await cb.answer()
-    await cb.message.edit_text("Главное меню:", reply_markup=await get_main_menu(user.role))
+
+    # Проверяем, какие пункты доступны роли
+    async with get_session() as session:
+        visible = set(await get_visible_menu_items_for_role(session, user.role))
+
+    lines = ["Главное меню:"]
+    if any(it in visible for it in PROCURE_GROUP):
+        lines.append("🧾 Закупки-поступления — операции закупки и поступлений.")
+    if any(it in visible for it in PACK_GROUP):
+        lines.append("📦 Упаковка-поставки — упаковка, поставки и сборка.")
+    # одиночные верхнего уровня
+    if any(mi.name == "reports" for mi in visible):
+        lines.append("📈 Отчёты — формирование аналитических отчётов.")
+    if any(mi.name == "admin" for mi in visible):
+        lines.append("⚙️ Администрирование — управление пользователями, складами и настройками.")
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=await get_main_menu(user.role))
+
 
 async def show_procure_menu(cb: types.CallbackQuery, user: User):
-    """Подменю «Закупки-поступления»: Закупка CN, Склад MSK, Поступление."""
+    """Подменю «Закупки-поступления»: описания для каждой видимой кнопки."""
     await cb.answer()
-    await cb.message.edit_text("Закупки-поступления:", reply_markup=await get_procure_submenu(user.role))
+    async with get_session() as session:
+        visible = set(await get_visible_menu_items_for_role(session, user.role))
+
+    lines = ["Закупки-поступления:"]
+    for it in PROCURE_GROUP:
+        if it in visible:
+            lines.append(f"{TEXTS[it]} — {mv.DESCRIPTIONS.get(it, 'Описание отсутствует.')}")
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=await get_procure_submenu(user.role))
+
 
 async def show_pack_menu(cb: types.CallbackQuery, user: User):
-    """Подменю «Упаковка-поставки»: Упаковка, Поставки, Сборка, Остатки."""
+    """Подменю «Упаковка-поставки»: описания для каждой видимой кнопки."""
     await cb.answer()
-    await cb.message.edit_text("Упаковка-поставки:", reply_markup=await get_pack_submenu(user.role))
+    async with get_session() as session:
+        visible = set(await get_visible_menu_items_for_role(session, user.role))
+
+    lines = ["Упаковка-поставки:"]
+    for it in PACK_GROUP:
+        if it in visible:
+            lines.append(f"{TEXTS[it]} — {mv.DESCRIPTIONS.get(it, 'Описание отсутствует.')}")
+
+    await cb.message.edit_text("\n".join(lines), reply_markup=await get_pack_submenu(user.role))
 
 
 # ---------------------------
@@ -324,8 +365,8 @@ def register_common_handlers(dp: Dispatcher):
     dp.message.register(cmd_start, CommandStart())
     dp.callback_query.register(handle_admin_decision, lambda c: c.data.startswith(("approve:", "reject:")))
 
-    # Корневая навигация (новые категории)
-    dp.callback_query.register(show_root_menu,   lambda c: c.data == "root:main")
+    # Корневая навигация (с описаниями)
+    dp.callback_query.register(show_root_menu,    lambda c: c.data == "root:main")
     dp.callback_query.register(show_procure_menu, lambda c: c.data == "root:procure")
     dp.callback_query.register(show_pack_menu,    lambda c: c.data == "root:pack")
 
@@ -336,8 +377,6 @@ def register_common_handlers(dp: Dispatcher):
     dp.callback_query.register(on_postavki, lambda c: c.data == "postavki")
     dp.callback_query.register(on_otchety,  lambda c: c.data == "otchety")
     dp.callback_query.register(back_to_main_menu, lambda c: c.data == "back_to_menu")
-    # Подключить экран видимости (если отдельный роутер)
-
 
     # Подключить совместимость (последним из меню-роутеров)
     from handlers import common_compat

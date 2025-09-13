@@ -515,7 +515,7 @@ async def admin_product_enter_article(message: types.Message, user: User, state:
     await state.set_state(ProductState.entering_name)
     await message.answer("Введите название товара:")
 
-async def admin_product_enter_name(message: types.Message, user: User, state: FSMContext):
+async def admin_product_enter_name(message: types.Message, state: FSMContext, user: User | None = None):
     name = (message.text or "").strip()
     if not name:
         await message.answer("Название пустое. Введите ещё раз:"); return
