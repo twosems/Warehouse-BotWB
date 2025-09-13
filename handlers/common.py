@@ -11,7 +11,11 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from sqlalchemy import select
 
 from config import ADMIN_TELEGRAM_ID
-from keyboards.main_menu import get_main_menu
+from keyboards.main_menu import (
+    get_main_menu,
+    get_procure_submenu,
+    get_pack_submenu,
+)
 from database.db import get_session, set_audit_user, init_db
 from database.models import User, UserRole
 
@@ -280,7 +284,27 @@ async def back_to_main_menu(cb: types.CallbackQuery, user: User, state: FSMConte
     await cb.answer()
     if state:
         await state.clear()
-    await cb.message.answer("Главное меню:", reply_markup=await get_main_menu(user.role))
+    # Не создаём новое сообщение, а переиспользуем текущее
+    await cb.message.edit_text("Главное меню:", reply_markup=await get_main_menu(user.role))
+
+
+# ---------------------------
+# Навигация по корневым категориям (новое)
+# ---------------------------
+async def show_root_menu(cb: types.CallbackQuery, user: User):
+    """Корневое меню: 2 категории + Отчёты + Администрирование (если разрешены)."""
+    await cb.answer()
+    await cb.message.edit_text("Главное меню:", reply_markup=await get_main_menu(user.role))
+
+async def show_procure_menu(cb: types.CallbackQuery, user: User):
+    """Подменю «Закупки-поступления»: Закупка CN, Склад MSK, Поступление."""
+    await cb.answer()
+    await cb.message.edit_text("Закупки-поступления:", reply_markup=await get_procure_submenu(user.role))
+
+async def show_pack_menu(cb: types.CallbackQuery, user: User):
+    """Подменю «Упаковка-поставки»: Упаковка, Поставки, Сборка, Остатки."""
+    await cb.answer()
+    await cb.message.edit_text("Упаковка-поставки:", reply_markup=await get_pack_submenu(user.role))
 
 
 # ---------------------------
@@ -300,12 +324,24 @@ def register_common_handlers(dp: Dispatcher):
     dp.message.register(cmd_start, CommandStart())
     dp.callback_query.register(handle_admin_decision, lambda c: c.data.startswith(("approve:", "reject:")))
 
+    # Корневая навигация (новые категории)
+    dp.callback_query.register(show_root_menu,   lambda c: c.data == "root:main")
+    dp.callback_query.register(show_procure_menu, lambda c: c.data == "root:procure")
+    dp.callback_query.register(show_pack_menu,    lambda c: c.data == "root:pack")
+
+    # Прежние заглушки (если где-то используются старые callbacks)
     dp.callback_query.register(on_ostatki,  lambda c: c.data == "ostatki")
     dp.callback_query.register(on_prihod,   lambda c: c.data == "prihod")
     dp.callback_query.register(on_korr_ost, lambda c: c.data == "korr_ost")
     dp.callback_query.register(on_postavki, lambda c: c.data == "postavki")
     dp.callback_query.register(on_otchety,  lambda c: c.data == "otchety")
     dp.callback_query.register(back_to_main_menu, lambda c: c.data == "back_to_menu")
+    # Подключить экран видимости (если отдельный роутер)
+
+
+    # Подключить совместимость (последним из меню-роутеров)
+    from handlers import common_compat
+    dp.include_router(common_compat.router)
 
     # Подключаем noop ПОСЛЕДНИМ
     dp.include_router(noop_router)

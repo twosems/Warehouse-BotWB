@@ -2,7 +2,7 @@
 import asyncio
 import logging
 from aiogram import Bot, Dispatcher
-
+from handlers import admin_menu_visibility
 from config import BOT_TOKEN, DB_URL
 from database.db import init_db
 from handlers.common import RoleCheckMiddleware, register_common_handlers
@@ -61,6 +61,7 @@ async def main():
     # === Роутеры/регистраторы ===
     register_admin_handlers(dp)
     dp.include_router(admin_backup_router)
+    dp.include_router(admin_menu_visibility.router)
 
     register_receiving_handlers(dp)
     register_stocks_handlers(dp)

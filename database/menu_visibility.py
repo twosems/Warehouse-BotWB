@@ -1,68 +1,102 @@
-# database/menu_visibility.py
 from __future__ import annotations
-from typing import Optional, Set
+from typing import Optional, Set, Dict, List
 
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from database.models import RoleMenuVisibility, UserRole, MenuItem
 
-# ДЕФОЛТЫ: что видит каждая роль из коробки
-DEFAULT_VISIBILITY = {
-    # Админ видит всё — автоматом покроет и будущие пункты
-    UserRole.admin: {item: True for item in MenuItem},
+# Человекочитаемые подписи и порядок показа в редакторе (единая точка правды)
+LABELS: Dict[MenuItem, str] = {
+    MenuItem.stocks:        "📦 Остатки",
+    MenuItem.receiving:     "➕ Поступление",
+    MenuItem.supplies:      "🚚 Поставки",
+    MenuItem.packing:       "🎁 Упаковка",
+    MenuItem.picking:       "🧰 Сборка",
+    MenuItem.reports:       "📈 Отчёты",
+    MenuItem.purchase_cn:   "🇨🇳 Закупка CN",
+    MenuItem.msk_warehouse: "🏢 Склад MSK",
 
-    # Пользователь: видит основные разделы, включая новые "Закупка CN" и "Склад MSK"
-    UserRole.user: {
-        MenuItem.stocks:         True,
-        MenuItem.receiving:      True,
-        MenuItem.supplies:       True,
-        MenuItem.packing:        True,
-        MenuItem.picking:        True,
-        MenuItem.reports:        True,
-        MenuItem.purchase_cn:    True,   # 🇨🇳 Закупка CN
-        MenuItem.msk_warehouse:  True,   # 🏢 Склад MSK
-        MenuItem.admin:          False,
+    MenuItem.admin:         "⚙️ Администрирование",
+}
+
+MENU_ORDER: List[MenuItem] = [
+    MenuItem.stocks,
+    MenuItem.receiving,
+    MenuItem.supplies,
+    MenuItem.packing,
+    MenuItem.picking,
+    MenuItem.reports,
+    MenuItem.purchase_cn,
+    MenuItem.msk_warehouse,
+    MenuItem.admin,
+]
+
+# Базовые дефолты (явно заданные пункты)
+DEFAULT_VISIBILITY: Dict[UserRole, Dict[MenuItem, bool]] = {
+    # Админ: вообще всё (включая будущие пункты — см. fallback ниже)
+    UserRole.admin: {
+        # можно ничего не перечислять — fallback покроет True на любые новые пункты
     },
-
-    # Менеджер: по умолчанию без прав на создание/приёмку CN/MSK
+    # Пользователь
+    UserRole.user: {
+        MenuItem.stocks:        True,
+        MenuItem.receiving:     True,
+        MenuItem.supplies:      True,
+        MenuItem.packing:       True,
+        MenuItem.picking:       True,
+        MenuItem.reports:       True,
+        MenuItem.purchase_cn:   True,
+        MenuItem.msk_warehouse: True,
+        MenuItem.admin:         False,
+    },
+    # Менеджер
     UserRole.manager: {
-        MenuItem.stocks:         True,
-        MenuItem.receiving:      False,
-        MenuItem.supplies:       True,
-        MenuItem.packing:        True,
-        MenuItem.picking:        True,
-        MenuItem.reports:        True,
-        MenuItem.purchase_cn:    False,  # можно включить позже
-        MenuItem.msk_warehouse:  False,  # можно включить позже
-        MenuItem.admin:          False,
+        MenuItem.stocks:        True,
+        MenuItem.receiving:     False,
+        MenuItem.supplies:      True,
+        MenuItem.packing:       True,
+        MenuItem.picking:       True,
+        MenuItem.reports:       True,
+        MenuItem.purchase_cn:   False,
+        MenuItem.msk_warehouse: False,
+        MenuItem.admin:         False,
     },
 }
 
+def _default_visible(role: UserRole, item: MenuItem) -> bool:
+    """
+    Фолбэк-дефолт для незаданных явно пунктов:
+      - admin -> True (видит всё)
+      - user/manager -> False (безопасный дефолт)
+    """
+    if role == UserRole.admin:
+        return True
+    return DEFAULT_VISIBILITY.get(role, {}).get(item, False)
 
 async def ensure_menu_visibility_defaults(session: AsyncSession) -> None:
     """
-    Гарантируем, что в role_menu_visibility есть записи для всех (role, item)
-    согласно DEFAULT_VISIBILITY. Ничего не перезаписываем – только добавляем отсутствующее.
+    Гарантируем, что в role_menu_visibility есть записи для всех (role, item):
+      - для admin: True по умолчанию,
+      - для остальных ролей: False, если не задано иное в DEFAULT_VISIBILITY.
+    Ничего не перезаписываем — только добавляем отсутствующие пары.
     """
+    # Читаем все существующие пары (role, item)
     res = await session.execute(
         select(RoleMenuVisibility.role, RoleMenuVisibility.item)
     )
     existing = {(row[0], row[1]) for row in res.all()}
 
     to_add: list[RoleMenuVisibility] = []
-    for role, mapping in DEFAULT_VISIBILITY.items():
-        for item, visible in mapping.items():
-            key = (role, item)
-            if key not in existing:
-                to_add.append(
-                    RoleMenuVisibility(role=role, item=item, visible=visible)
-                )
+    for role in UserRole:
+        for item in MenuItem:
+            if (role, item) not in existing:
+                default = DEFAULT_VISIBILITY.get(role, {}).get(item, _default_visible(role, item))
+                to_add.append(RoleMenuVisibility(role=role, item=item, visible=default))
 
     if to_add:
         session.add_all(to_add)
         await session.commit()
-
 
 async def get_visible_menu_items_for_role(
         session: AsyncSession,
@@ -79,6 +113,24 @@ async def get_visible_menu_items_for_role(
     )
     return {row[0] for row in res.all()}
 
+async def get_visibility_map_for_role(
+        session: AsyncSession,
+        role: UserRole,
+) -> Dict[MenuItem, bool]:
+    """
+    Возвращает словарь {MenuItem: visible} для роли — удобно для экрана редактора.
+    Если каких-то пунктов внезапно нет — не беда, вернём False (но ensure_* лучше вызвать).
+    """
+    res = await session.execute(
+        select(RoleMenuVisibility.item, RoleMenuVisibility.visible).where(
+            RoleMenuVisibility.role == role
+        )
+    )
+    data = {row[0]: row[1] for row in res.all()}
+    # на всякий случай заполним отсутствующие ключи фолбэком
+    for mi in MenuItem:
+        data.setdefault(mi, _default_visible(role, mi))
+    return data
 
 async def toggle_menu_visibility(
         session: AsyncSession,
@@ -99,8 +151,8 @@ async def toggle_menu_visibility(
     vm = res.scalar_one_or_none()
 
     if vm is None:
-        # если записи нет — создадим с дефолтом или переданным value
-        default = DEFAULT_VISIBILITY.get(role, {}).get(item, True)
+        # если записи нет — создадим с корректным дефолтом или переданным value
+        default = _default_visible(role, item)
         vm = RoleMenuVisibility(
             role=role, item=item, visible=default if value is None else bool(value)
         )

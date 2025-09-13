@@ -14,13 +14,8 @@ from database.models import (
     Warehouse, Product,
     StockMovement, Supply, SupplyItem,
     AuditLog,
-    MenuItem, RoleMenuVisibility,
 )
-from database.menu_visibility import (
-    ensure_menu_visibility_defaults,
-    get_visible_menu_items_for_role,
-    toggle_menu_visibility,
-)
+
 from handlers.common import send_content
 
 # =========================
@@ -59,7 +54,8 @@ def kb_admin_root() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="💾 Бэкапы", callback_data="admin:backup")],
         # Кнопка экстренного восстановления — работает даже при падении БД
         [InlineKeyboardButton(text="🆘 Emergency Restore", callback_data="bk:restore_emergency")],
-        [InlineKeyboardButton(text="🧩 Настройки меню", callback_data="adm_menu_roles")],
+        # Настройки видимости меню — теперь ведут в handlers/admin_menu_visibility.py
+        [InlineKeyboardButton(text="🧩 Настройки меню", callback_data="menuvis:roles")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")],
     ])
 
@@ -152,33 +148,6 @@ def kb_pick_role(telegram_id: int, current: UserRole) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"{mark(UserRole.manager)}Менеджер",     callback_data=f"role_set:{telegram_id}:manager")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_change_role")],
     ])
-
-# --- Настройки меню: выбор роли и переключатели ---
-def kb_menu_roles_root() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚙️ Настройки меню: admin",   callback_data="adm_menu_role:admin")],
-        [InlineKeyboardButton(text="⚙️ Настройки меню: user",    callback_data="adm_menu_role:user")],
-        [InlineKeyboardButton(text="⚙️ Настройки меню: manager", callback_data="adm_menu_role:manager")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin")],
-    ])
-
-def kb_menu_visibility(role: UserRole, state_map: dict) -> InlineKeyboardMarkup:
-    def mark(flag): return "✅" if flag else "🚫"
-    rows = []
-    for key, label in [
-        ("stocks", "📦 Остатки"),
-        ("receiving", "➕ Поступление"),
-        ("supplies", "🚚 Поставки"),
-        ("packing", "🎁 Упаковка"),
-        ("reports", "📈 Отчёты"),
-        ("admin", "⚙️ Администрирование"),
-    ]:
-        rows.append([InlineKeyboardButton(
-            text=f"{label} {mark(state_map.get(key, False))}",
-            callback_data=f"adm_menu_toggle:{role.value}:{key}"
-        )])
-    rows.append([InlineKeyboardButton(text="⬅️ К выбору роли", callback_data="adm_menu_roles")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 # =========================
@@ -758,55 +727,6 @@ async def admin_audit_page(cb: types.CallbackQuery, user: User, state: FSMContex
 
 
 # =========================
-#    MENU VISIBILITY
-# =========================
-async def admin_menu_roles_root(cb: types.CallbackQuery, user: User, state: FSMContext):
-    if user.role != UserRole.admin:
-        await cb.answer("Доступ запрещен.", show_alert=True); return
-    await cb.answer()
-    async with get_session() as session:
-        await ensure_menu_visibility_defaults(session)
-    await send_content(cb, "Выберите роль для настройки видимости меню:", reply_markup=kb_menu_roles_root())
-
-async def admin_menu_role(cb: types.CallbackQuery, user: User, state: FSMContext):
-    if user.role != UserRole.admin:
-        await cb.answer("Доступ запрещен.", show_alert=True); return
-    await cb.answer()
-    try:
-        _, role_str = cb.data.split(":")
-        role = UserRole(role_str)
-    except Exception:
-        await cb.answer("Некорректные данные.", show_alert=True); return
-
-    async with get_session() as session:
-        res = await session.execute(select(RoleMenuVisibility).where(RoleMenuVisibility.role == role))
-        rows = res.scalars().all()
-    state_map = {r.item.value: r.visible for r in rows}
-    await send_content(cb, f"Настройки меню для роли {role.value}:",
-                       reply_markup=kb_menu_visibility(role, state_map))
-
-async def admin_menu_toggle(cb: types.CallbackQuery, user: User, state: FSMContext):
-    if user.role != UserRole.admin:
-        await cb.answer("Доступ запрещен.", show_alert=True); return
-    await cb.answer()
-    try:
-        _, role_str, key = cb.data.split(":")
-        role = UserRole(role_str)
-        item = MenuItem(key)
-    except Exception:
-        await cb.answer("Некорректные данные.", show_alert=True); return
-
-    async with get_session() as session:
-        new_flag = await toggle_menu_visibility(session, role, item)
-        res = await session.execute(select(RoleMenuVisibility).where(RoleMenuVisibility.role == role))
-        rows = res.scalars().all()
-
-    state_map = {r.item.value: r.visible for r in rows}
-    await send_content(cb, f"Настройки меню для роли {role.value} (обновлено {item.value}: {'вкл' if new_flag else 'выкл'}):",
-                       reply_markup=kb_menu_visibility(role, state_map))
-
-
-# =========================
 #     REGISTER ROUTES
 # =========================
 def register_admin_handlers(dp: Dispatcher):
@@ -857,8 +777,3 @@ def register_admin_handlers(dp: Dispatcher):
     # Журнал
     dp.callback_query.register(admin_audit_root,           lambda c: c.data == "admin_audit")
     dp.callback_query.register(admin_audit_page,           lambda c: c.data.startswith("admin_audit_page:"))
-
-    # Настройки меню
-    dp.callback_query.register(admin_menu_roles_root,      lambda c: c.data == "adm_menu_roles")
-    dp.callback_query.register(admin_menu_role,            lambda c: c.data.startswith("adm_menu_role:"))
-    dp.callback_query.register(admin_menu_toggle,          lambda c: c.data.startswith("adm_menu_toggle:"))
