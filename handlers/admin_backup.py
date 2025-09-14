@@ -1,6 +1,6 @@
 # handlers/admin_backup.py
 from __future__ import annotations
-
+import sys
 import asyncio
 import html
 import json
@@ -433,18 +433,18 @@ MAX_BACKUP_SIZE_MB = 2048
 
 def build_restore_cmd(filepath: str) -> str:
     """
-    Формирует команду для запуска скрипта восстановления.
-    - windows: powershell -NoProfile -ExecutionPolicy Bypass -File "<SCRIPT>" -BackupPath "<file>"
-    - linux:   sudo /path/to/wb_db_restore.sh '<file>'
+    Платформенно-безопасная команда восстановления.
+    На Windows-хосте всегда PowerShell, на Linux-хосте всегда linux-скрипт.
+    Любые значения RESTORE_DRIVER из .env игнорируются, чтобы локалка не ломала сервер.
     """
-    driver = (RESTORE_DRIVER or "linux").lower()
     script = RESTORE_SCRIPT_PATH or ""
-    if driver == "windows":
-        # Безопасные кавычки для PowerShell путей
+    if sys.platform.startswith("win"):
+        # Windows: PowerShell-скрипт
         return f'powershell -NoProfile -ExecutionPolicy Bypass -File "{script}" -BackupPath "{filepath}"'
-    # linux
-    quoted = shlex.quote(filepath)
-    return f"sudo {shlex.quote(script)} {quoted}"
+    else:
+        # Linux: shell-скрипт с sudo
+        quoted = shlex.quote(filepath)
+        return f"sudo {shlex.quote(script)} {quoted}"
 
 
 async def _restore_open_common(target: Union[CallbackQuery, Message], state: FSMContext):
