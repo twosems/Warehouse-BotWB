@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -180,6 +181,29 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
         await s.commit()
 
     return True, msg
+
+
+# -------------------- Restore command builder (server-only) --------------------
+
+def build_restore_cmd(filepath: str) -> str:
+    """
+    Собирает команду восстановления строго для сервера.
+    Всегда вызывает системный скрипт /usr/local/sbin/botwb-restore через sudo -n.
+    На Windows запрещаем выполнение.
+    """
+    # Разрешаем restore только на сервере
+    if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
+        raise RuntimeError("Restore доступен только на сервере (HOST_ROLE != server)")
+
+    if sys.platform.startswith("win"):
+        raise RuntimeError("Restore недоступен на Windows")
+
+    restore_path = os.environ.get("RESTORE_SCRIPT_PATH")
+    if not restore_path or not (os.path.isfile(restore_path) and os.access(restore_path, os.X_OK)):
+        raise RuntimeError("RESTORE_SCRIPT_PATH не задан или не исполняем")
+
+    # Вызываем наш серверный скрипт
+    return f"sudo -n {shlex.quote(restore_path)} {shlex.quote(filepath)}"
 
 
 # --- Backward compatibility aliases -----------------------------------------
