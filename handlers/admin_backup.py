@@ -430,23 +430,6 @@ async def bk_run(cb: CallbackQuery):
 ALLOWED_EXT = {".backup", ".backup.gz", ".dump", ".sql", ".sql.gz"}
 MAX_BACKUP_SIZE_MB = 2048
 
-
-def build_restore_cmd(filepath: str) -> str:
-    """
-    Платформенно-безопасная команда восстановления.
-    На Windows-хосте всегда PowerShell, на Linux-хосте всегда linux-скрипт.
-    Любые значения RESTORE_DRIVER из .env игнорируются, чтобы локалка не ломала сервер.
-    """
-    script = RESTORE_SCRIPT_PATH or ""
-    if sys.platform.startswith("win"):
-        # Windows: PowerShell-скрипт
-        return f'powershell -NoProfile -ExecutionPolicy Bypass -File "{script}" -BackupPath "{filepath}"'
-    else:
-        # Linux: shell-скрипт с sudo
-        quoted = shlex.quote(filepath)
-        return f"sudo {shlex.quote(script)} {quoted}"
-
-
 async def _restore_open_common(target: Union[CallbackQuery, Message], state: FSMContext):
     await state.clear()
     await state.set_state(BackupState.waiting_restore_file)
