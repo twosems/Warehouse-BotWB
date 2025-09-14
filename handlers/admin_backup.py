@@ -518,13 +518,12 @@ async def bk_restore_file(msg: Message, state: FSMContext):
         "Иначе отправьте /cancel".format(html.escape(msg.document.file_name)),
         parse_mode="HTML",
     )
-
-
 @router.message(BackupState.waiting_restore_confirm)
 async def bk_restore_confirm(msg: Message, state: FSMContext):
     if msg.from_user.id != ADMIN_TELEGRAM_ID:
         return
 
+    # Требуем точную фразу-подтверждение
     if (msg.text or "").strip() != "Я ОТДАЮ СЕБЕ ОТЧЁТ":
         await msg.answer("Нужно написать ровно: Я ОТДАЮ СЕБЕ ОТЧЁТ")
         return
@@ -538,22 +537,28 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
     data = await state.get_data()
     filepath = data["filepath"]
 
-    # Доп. проверка: если Linux — убедимся, что скрипт задан
-    if not sys.platform.startswith("win"):
-        if not RESTORE_SCRIPT_PATH or not os.path.exists(RESTORE_SCRIPT_PATH):
-            await msg.answer("RESTORE_SCRIPT_PATH не задан или не существует на сервере.")
+    # --- Preflight RESTORE_SCRIPT_PATH (строго серверный скрипт) ---
+    # 1) из окружения сервиса, 2) подстраховка значением из config (если есть)
+    restore_path = os.environ.get("RESTORE_SCRIPT_PATH") or (RESTORE_SCRIPT_PATH or None)
+    if not restore_path or not (os.path.isfile(restore_path) and os.access(restore_path, os.X_OK)):
+        await msg.answer(
+            "♻️ Восстановление недоступно: RESTORE_SCRIPT_PATH не задан "
+            "или файл не существует/не исполняем на сервере."
+        )
+        try:
+            shutil.rmtree(data.get("tmpdir", ""), ignore_errors=True)
+        finally:
             await state.clear()
-            try:
-                shutil.rmtree(data.get("tmpdir", ""), ignore_errors=True)
-            finally:
-                return
+        return
+    # --- /Preflight ---
 
     await msg.answer("Запускаю восстановление… Пришлю лог выполнения.")
 
-    # Команда (Windows/Linux формируется в build_restore_cmd)
-    cmd = build_restore_cmd(filepath)
+    # Команда: запускаем строго серверный скрипт через sudo -n
+    # (используем shell и экранируем аргументы)
+    cmd = f"sudo -n {shlex.quote(restore_path)} {shlex.quote(filepath)}"
 
-    # Пробрасываем PG-переменные из DB_URL
+    # Пробрасываем PG-переменные из DB_URL (для удобства pg_restore/psql)
     env = os.environ.copy()
     try:
         u = make_url(DB_URL)
