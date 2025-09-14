@@ -20,12 +20,11 @@ from database.models import BackupSettings
 # OAuth (личный Google Drive)
 from utils.gdrive_oauth import build_drive_oauth, upload_file, cleanup_old
 
-# Если хочешь сохранить совместимость с режимом сервис-аккаунта (Shared Drive),
-# оставляем try/except — файл utils/gdrive.py может отсутствовать, и это ок.
+# Режим сервис-аккаунта (Shared Drive) — опционально
 try:
     from utils.gdrive import build_drive as build_drive_sa  # type: ignore
 except Exception:
-    build_drive_sa = None  # noqa
+    build_drive_sa = None  # noqa: F401
 
 from config import (
     PG_DUMP_PATH,
@@ -55,10 +54,22 @@ def _human_mb(path: str) -> float:
 
 
 def _resolve_pg_dump() -> str | None:
-    """Возвращает путь к pg_dump: из .env (PG_DUMP_PATH) или из PATH."""
+    """
+    Возвращает путь к pg_dump:
+      1) сначала пробуем найти в PATH текущего хоста;
+      2) затем используем PG_DUMP_PATH ТОЛЬКО если файл реально существует на ЭТОМ хосте.
+    Так мы игнорируем "виндовые" пути, случайно попавшие из .env.
+    """
+    found = shutil.which("pg_dump")
+    if found:
+        return found
+
     if PG_DUMP_PATH:
-        return str(Path(PG_DUMP_PATH).resolve())
-    return shutil.which("pg_dump")
+        p = Path(PG_DUMP_PATH)
+        if p.is_file():
+            return str(p.resolve())
+
+    return None
 
 
 async def run_backup(db_url: str) -> Tuple[bool, str]:
@@ -66,6 +77,11 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
     Делает pg_dump и грузит в Google Drive согласно backup_settings (id=1).
     Возвращает (ok, message).
     """
+
+    # Охранный флаг: не запускаем бэкап на не-серверных хостах.
+    if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
+        return False, "Backups are disabled on non-server host (HOST_ROLE != server)"
+
     # 1) Читаем настройки
     async with get_session() as s:
         st = (
@@ -93,7 +109,7 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
 
             pg_dump_bin = _resolve_pg_dump()
             if not pg_dump_bin:
-                return False, "pg_dump not found (set PG_DUMP_PATH or add to PATH)"
+                return False, "pg_dump not found on PATH and PG_DUMP_PATH is invalid"
 
             cmd = [
                 pg_dump_bin,
@@ -101,8 +117,8 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
                 "-p", str(params["port"]),
                 "-U", params["user"],
                 "-d", params["database"],
-                "-F", "c",
-                "-Z", "9",
+                "-F", "c",           # custom формат .backup
+                "-Z", "9",           # сжатие в pg_dump
                 "-f", fpath,
             ]
 
@@ -112,7 +128,7 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
 
             t0 = time.monotonic()
             try:
-                subprocess.run(cmd, timeout=900, **kw)  # 15 минут таймаут
+                subprocess.run(cmd, timeout=900, **kw)  # таймаут 15 минут
             except subprocess.TimeoutExpired:
                 return False, "pg_dump timeout (900s)"
             except subprocess.CalledProcessError as e:
@@ -121,7 +137,7 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
             duration = round(time.monotonic() - t0, 2)
             size_mb = _human_mb(fpath)
 
-            # 3) Загрузка в Google Drive (OAuth по умолчанию)
+            # 3) Загрузка в Google Drive
             try:
                 mode = (GOOGLE_AUTH_MODE or "oauth").lower()
 
@@ -133,7 +149,7 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
                     # ВНИМАНИЕ: для SA нужен Shared Drive
                     drive = build_drive_sa(st.gdrive_sa_json)
                 else:
-                    # OAuth: личный Drive. Требуются client_secret.json и сохранится token.json
+                    # OAuth: личный Drive. Нужны client_secret.json и token.json
                     drive = build_drive_oauth(GOOGLE_OAUTH_CLIENT_PATH, GOOGLE_OAUTH_TOKEN_PATH)
 
                 file_id = upload_file(drive, fpath, fname, st.gdrive_folder_id)
