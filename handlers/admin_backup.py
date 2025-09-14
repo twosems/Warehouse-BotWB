@@ -1,6 +1,7 @@
 # handlers/admin_backup.py
 from __future__ import annotations
 
+import sys
 import asyncio
 import html
 import json
@@ -9,7 +10,7 @@ import shlex
 import shutil
 import tempfile
 from typing import Union
-import contextlib
+
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
@@ -24,20 +25,20 @@ from aiogram.types import (
     FSInputFile,
 )
 from sqlalchemy import select
+from sqlalchemy.engine.url import make_url
 
 from config import (
     ADMIN_TELEGRAM_ID,
     TIMEZONE,
-    RESTORE_DRIVER,
     RESTORE_SCRIPT_PATH,
+    DB_URL,
 )
+
 from database.db import get_session, init_db, reset_db_engine, ping_db
 from database.models import BackupSettings, BackupFrequency
 from scheduler.backup_scheduler import reschedule_backup
 from utils.backup import run_backup
-from sqlalchemy.engine.url import make_url
-from config import DB_URL
-from database.db import reset_db_engine, ping_db
+
 router = Router()
 
 
@@ -72,7 +73,6 @@ async def _ensure_settings_exists(msg_or_cb: Union[Message, CallbackQuery]) -> B
 
     if not st:
         try:
-            # поднимем схему БД
             await init_db()
             async with get_session() as s:
                 st = await s.get(BackupSettings, 1)
@@ -427,24 +427,24 @@ async def bk_run(cb: CallbackQuery):
 
 
 # ===== Restore =====
-ALLOWED_EXT = {".backup", ".dump", ".sql", ".sql.gz"}
+ALLOWED_EXT = {".backup", ".backup.gz", ".dump", ".sql", ".sql.gz"}
 MAX_BACKUP_SIZE_MB = 2048
 
 
 def build_restore_cmd(filepath: str) -> str:
     """
-    Формирует команду для запуска скрипта восстановления.
-    - windows: powershell -NoProfile -ExecutionPolicy Bypass -File "<SCRIPT>" -BackupPath "<file>"
-    - linux:   sudo /path/to/wb_db_restore.sh '<file>'
+    Платформенно-безопасная команда восстановления.
+    На Windows-хосте всегда PowerShell, на Linux-хосте всегда linux-скрипт.
+    Любые значения RESTORE_DRIVER из .env игнорируются, чтобы локалка не ломала сервер.
     """
-    driver = (RESTORE_DRIVER or "linux").lower()
     script = RESTORE_SCRIPT_PATH or ""
-    if driver == "windows":
-        # Безопасные кавычки для PowerShell путей
+    if sys.platform.startswith("win"):
+        # Windows: PowerShell-скрипт
         return f'powershell -NoProfile -ExecutionPolicy Bypass -File "{script}" -BackupPath "{filepath}"'
-    # linux
-    quoted = shlex.quote(filepath)
-    return f"sudo {shlex.quote(script)} {quoted}"
+    else:
+        # Linux: shell-скрипт с sudo
+        quoted = shlex.quote(filepath)
+        return f"sudo {shlex.quote(script)} {quoted}"
 
 
 async def _restore_open_common(target: Union[CallbackQuery, Message], state: FSMContext):
@@ -453,7 +453,8 @@ async def _restore_open_common(target: Union[CallbackQuery, Message], state: FSM
     text = (
         "♻️ Восстановление БД\n\n"
         "Пришлите файл бэкапа <b>документом</b>.\n"
-        "Поддерживаемые форматы: <code>.backup</code>, <code>.dump</code>, <code>.sql</code>, <code>.sql.gz</code>\n"
+        "Поддерживаемые форматы: <code>.backup</code>, <code>.backup.gz</code>, <code>.dump</code>, "
+        "<code>.sql</code>, <code>.sql.gz</code>\n"
         "⚠️ ВНИМАНИЕ: действующая БД будет перезаписана."
     )
     if isinstance(target, CallbackQuery):
@@ -463,20 +464,28 @@ async def _restore_open_common(target: Union[CallbackQuery, Message], state: FSM
         await target.answer(text, parse_mode="HTML")
 
 
-# Обычный сценарий из меню бэкапов (с обращением к настройкам)
+# Обычный сценарий (через меню)
 @router.callback_query(F.data == "bk:restore")
 async def bk_restore_open(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_TELEGRAM_ID:
         return
-    # гарантируем, что настройки доступны (но даже при ошибке дадим продолжить)
-    await _ensure_settings_exists(cb)
+    # Блокируем восстановление не на сервере
+    if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
+        await cb.message.edit_text("Восстановление разрешено только на сервере (HOST_ROLE != server).")
+        await cb.answer()
+        return
+    await _ensure_settings_exists(cb)  # не критично, но подтянем настройки
     await _restore_open_common(cb, state)
 
 
-# Emergency Restore (без обращения к БД вообще)
+# Emergency Restore (без обращения к БД)
 @router.callback_query(F.data == "bk:restore_emergency")
 async def bk_restore_emergency(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_TELEGRAM_ID:
+        return
+    if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
+        await cb.message.edit_text("Восстановление разрешено только на сервере (HOST_ROLE != server).")
+        await cb.answer()
         return
     await _restore_open_common(cb, state)
 
@@ -491,7 +500,7 @@ async def bk_restore_file(msg: Message, state: FSMContext):
 
     name = (msg.document.file_name or "").lower()
     if not any(name.endswith(ext) for ext in ALLOWED_EXT):
-        await msg.answer("Неподдерживаемый формат. Разрешены: .backup, .dump, .sql, .sql.gz")
+        await msg.answer("Неподдерживаемый формат. Разрешены: .backup, .backup.gz, .dump, .sql, .sql.gz")
         return
     if msg.document.file_size and msg.document.file_size > MAX_BACKUP_SIZE_MB * 1024 * 1024:
         await msg.answer(f"Файл слишком большой (> {MAX_BACKUP_SIZE_MB} МБ).")
@@ -520,15 +529,31 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
         await msg.answer("Нужно написать ровно: Я ОТДАЮ СЕБЕ ОТЧЁТ")
         return
 
+    # Охранный флаг: только сервер
+    if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
+        await msg.answer("Восстановление разрешено только на сервере (HOST_ROLE != server).")
+        await state.clear()
+        return
+
     data = await state.get_data()
     filepath = data["filepath"]
+
+    # Доп. проверка: если Linux — убедимся, что скрипт задан
+    if not sys.platform.startswith("win"):
+        if not RESTORE_SCRIPT_PATH or not os.path.exists(RESTORE_SCRIPT_PATH):
+            await msg.answer("RESTORE_SCRIPT_PATH не задан или не существует на сервере.")
+            await state.clear()
+            try:
+                shutil.rmtree(data.get("tmpdir", ""), ignore_errors=True)
+            finally:
+                return
 
     await msg.answer("Запускаю восстановление… Пришлю лог выполнения.")
 
     # Команда (Windows/Linux формируется в build_restore_cmd)
     cmd = build_restore_cmd(filepath)
 
-    # === Пробрасываем PGPASSWORD и прочие PG* из DB_URL ===
+    # Пробрасываем PG-переменные из DB_URL
     env = os.environ.copy()
     try:
         u = make_url(DB_URL)
@@ -543,7 +568,6 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
         if u.database:
             env["PGDATABASE"] = u.database
     except Exception:
-        # не критично, просто идём дальше
         pass
 
     try:
@@ -551,7 +575,7 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
             cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            env=env,  # <-- ВАЖНО
+            env=env,
         )
         out, _ = await proc.communicate()
         code = proc.returncode
@@ -582,7 +606,10 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
                 await msg.answer("✅ Пул подключений к БД пересоздан, соединение проверено.")
             except Exception as e:
                 err = html.escape(repr(e))
-                await msg.answer(f"⚠️ Бэкап восстановлен, но не удалось проверить соединение:\n<pre>{err}</pre>", parse_mode="HTML")
+                await msg.answer(
+                    f"⚠️ Бэкап восстановлен, но не удалось проверить соединение:\n<pre>{err}</pre>",
+                    parse_mode="HTML",
+                )
 
     except Exception as e:
         err = html.escape(repr(e))
