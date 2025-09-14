@@ -6,7 +6,6 @@ import asyncio
 import html
 import json
 import os
-import shlex
 import shutil
 import tempfile
 from typing import Union
@@ -30,14 +29,13 @@ from sqlalchemy.engine.url import make_url
 from config import (
     ADMIN_TELEGRAM_ID,
     TIMEZONE,
-    RESTORE_SCRIPT_PATH,
     DB_URL,
 )
 
 from database.db import get_session, init_db, reset_db_engine, ping_db
 from database.models import BackupSettings, BackupFrequency
 from scheduler.backup_scheduler import reschedule_backup
-from utils.backup import run_backup
+from utils.backup import run_backup, build_restore_cmd
 
 router = Router()
 
@@ -430,6 +428,7 @@ async def bk_run(cb: CallbackQuery):
 ALLOWED_EXT = {".backup", ".backup.gz", ".dump", ".sql", ".sql.gz"}
 MAX_BACKUP_SIZE_MB = 2048
 
+
 async def _restore_open_common(target: Union[CallbackQuery, Message], state: FSMContext):
     await state.clear()
     await state.set_state(BackupState.waiting_restore_file)
@@ -501,6 +500,8 @@ async def bk_restore_file(msg: Message, state: FSMContext):
         "Иначе отправьте /cancel".format(html.escape(msg.document.file_name)),
         parse_mode="HTML",
     )
+
+
 @router.message(BackupState.waiting_restore_confirm)
 async def bk_restore_confirm(msg: Message, state: FSMContext):
     if msg.from_user.id != ADMIN_TELEGRAM_ID:
@@ -520,9 +521,8 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
     data = await state.get_data()
     filepath = data["filepath"]
 
-    # --- Preflight RESTORE_SCRIPT_PATH (строго серверный скрипт) ---
-    # 1) из окружения сервиса, 2) подстраховка значением из config (если есть)
-    restore_path = os.environ.get("RESTORE_SCRIPT_PATH") or (RESTORE_SCRIPT_PATH or None)
+    # --- Preflight RESTORE_SCRIPT_PATH (строго серверный скрипт из ENV) ---
+    restore_path = os.environ.get("RESTORE_SCRIPT_PATH")
     if not restore_path or not (os.path.isfile(restore_path) and os.access(restore_path, os.X_OK)):
         await msg.answer(
             "♻️ Восстановление недоступно: RESTORE_SCRIPT_PATH не задан "
@@ -537,11 +537,10 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
 
     await msg.answer("Запускаю восстановление… Пришлю лог выполнения.")
 
-    # Команда: запускаем строго серверный скрипт через sudo -n
-    # (используем shell и экранируем аргументы)
-    cmd = f"sudo -n {shlex.quote(restore_path)} {shlex.quote(filepath)}"
+    # Команда: централизованная сборка (sudo -n $RESTORE_SCRIPT_PATH <file>)
+    cmd = build_restore_cmd(filepath)
 
-    # Пробрасываем PG-переменные из DB_URL (для удобства pg_restore/psql)
+    # Пробрасываем PG-переменные из DB_URL (удобно для инструментов)
     env = os.environ.copy()
     try:
         u = make_url(DB_URL)

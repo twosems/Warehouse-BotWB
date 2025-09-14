@@ -2,14 +2,14 @@
 import os
 from dotenv import load_dotenv
 
-# Загружаем переменные из .env в окружение
+# Загружаем переменные из .env (локально), на сервере systemd передаёт env сам
 load_dotenv()
 
 
 def getenv_bool(name: str, default: bool = False) -> bool:
     """
-    Получить переменную окружения как bool.
-    Значения '1', 'true', 'yes', 'y', 'on' → True.
+    Получить переменную окружения как bool:
+    '1', 'true', 'yes', 'y', 'on' → True.
     """
     val = os.getenv(name)
     if val is None:
@@ -29,32 +29,38 @@ DB_URL = os.getenv(
 
 # --- Google (Sheets / Drive) ---
 GOOGLE_CREDENTIALS_PATH = os.getenv("GOOGLE_CREDENTIALS_PATH")  # путь к credentials.json (если используете Drive/Sheets)
-GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # опционально: для экспорта в таблицы
-GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")  # ID папки в Drive (опц.)
+GOOGLE_SHEET_ID = os.getenv("GOOGLE_SHEET_ID")                  # опционально: для экспорта в таблицы
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")    # ID папки в Drive (опц.)
 GOOGLE_DRIVE_PUBLIC = getenv_bool("GOOGLE_DRIVE_PUBLIC", False)
 
-# --- Backups ---
-BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
-PG_DUMP_PATH = os.getenv("PG_DUMP_PATH")  # Windows: полный путь к pg_dump.exe; Linux: обычно не нужен
-
-# --- Timezone / Logging ---
-TIMEZONE = os.getenv("timezone", "Europe/Berlin")  # часовой пояс по умолчанию
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")   # уровень логов
-# --- Google Drive auth mode ---
+# Режим авторизации к Google Drive:
 # 'oauth' (личный Drive) или 'sa' (service account). По умолчанию oauth.
 GOOGLE_AUTH_MODE = os.getenv("GOOGLE_AUTH_MODE", "oauth")
-
 # Для OAuth:
 GOOGLE_OAUTH_CLIENT_PATH = os.getenv("GOOGLE_OAUTH_CLIENT_PATH", "client_secret.json")
 GOOGLE_OAUTH_TOKEN_PATH = os.getenv("GOOGLE_OAUTH_TOKEN_PATH", "token.json")
-import os
 
-RESTORE_DRIVER = os.getenv("RESTORE_DRIVER", "linux")  # linux|windows
-RESTORE_SCRIPT_PATH = os.getenv("RESTORE_SCRIPT_PATH", "/usr/local/bin/wb_db_restore.sh")
+# --- Backups ---
+BACKUP_DIR = os.getenv("BACKUP_DIR", "backups")
+# Windows: полный путь к pg_dump.exe; Linux: обычно не нужен (ищется в PATH)
+PG_DUMP_PATH = os.getenv("PG_DUMP_PATH")
 
-DB_NAME  = os.getenv("DB_NAME", "warehouse_db")
-DB_USER  = os.getenv("DB_USER", "postgres")
-DB_HOST  = os.getenv("DB_HOST", "localhost")
-DB_PORT  = int(os.getenv("DB_PORT", "5432"))
+# --- Timezone / Logging ---
+# Поддерживаем обе переменные на всякий случай
+TIMEZONE = os.getenv("TIMEZONE") or os.getenv("timezone", "Europe/Berlin")
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
-PG_BIN   = os.getenv("PG_BIN")  # только для Windows, можно None
+# --- Restore (только сервер) ---
+# ВАЖНО: путь для restore берётся из ENV сервиса (systemd drop-in).
+# Эту константу держим лишь как справочную — код бота не должен на неё опираться.
+RESTORE_DRIVER = os.getenv("RESTORE_DRIVER", "linux")  # linux|windows (для совместимости; в проде linux)
+RESTORE_SCRIPT_PATH = os.getenv("RESTORE_SCRIPT_PATH", "/usr/local/sbin/botwb-restore")
+
+# --- Доп. переменные для совместимости/утилит (если где-то используются) ---
+DB_NAME = os.getenv("DB_NAME", "warehouse_db")
+DB_USER = os.getenv("DB_USER", "postgres")
+DB_HOST = os.getenv("DB_HOST", "localhost")
+DB_PORT = int(os.getenv("DB_PORT", "5432"))
+
+# Только для Windows (опционально, если требуется явный путь к бинарям)
+PG_BIN = os.getenv("PG_BIN")  # например: C:\\Program Files\\PostgreSQL\\15\\bin
