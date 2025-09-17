@@ -255,6 +255,12 @@ class CnPurchase(Base):
     items: Mapped[List["CnPurchaseItem"]] = relationship(
         back_populates="purchase", cascade="all, delete-orphan"
     )
+
+    # ФОТО: связь 1:N с фото
+    photos: Mapped[List["CnPurchasePhoto"]] = relationship(
+        back_populates="purchase", cascade="all, delete-orphan", lazy="selectin"
+    )
+
     # связь 1:1 с входящим МСК документом
     msk_inbound: Mapped[Optional["MskInboundDoc"]] = relationship(
         back_populates="cn_purchase", uselist=False, cascade="all, delete-orphan"
@@ -274,6 +280,23 @@ class CnPurchaseItem(Base):
 
     purchase: Mapped["CnPurchase"] = relationship(back_populates="items")
     product: Mapped["Product"] = relationship()
+
+
+# --- Фото для закупки CN ---
+class CnPurchasePhoto(Base):
+    __tablename__ = "cn_purchase_photos"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    cn_purchase_id: Mapped[int] = mapped_column(
+        ForeignKey("cn_purchases.id", ondelete="CASCADE"),
+        index=True, nullable=False
+    )
+    file_id: Mapped[str] = mapped_column(String(256), nullable=False)  # Telegram file_id
+    caption: Mapped[Optional[str]] = mapped_column(String(512))
+    uploaded_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
+    uploaded_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))
+
+    purchase: Mapped["CnPurchase"] = relationship(back_populates="photos")
 
 
 # ===== Входящие МСК (создаются на статусе CN=3) =====
@@ -303,6 +326,9 @@ class MskInboundDoc(Base):
     warehouse_id: Mapped[Optional[int]] = mapped_column(
         "target_warehouse_id", ForeignKey("warehouses.id"), nullable=True
     )
+
+    # НОВОЕ: когда выбран склад назначения (для таймлайна MSK)
+    to_our_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     received_at: Mapped[Optional[datetime]]
     received_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))

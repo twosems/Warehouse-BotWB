@@ -52,9 +52,6 @@ def kb_admin_root() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="👥 Пользователи", callback_data="admin_users")],
         [InlineKeyboardButton(text="🧾 Журнал действий", callback_data="admin_audit")],
         [InlineKeyboardButton(text="💾 Бэкапы", callback_data="admin:backup")],
-        # Кнопка экстренного восстановления — работает даже при падении БД
-        [InlineKeyboardButton(text="🆘 Emergency Restore", callback_data="bk:restore_emergency")],
-        # Настройки видимости меню — теперь ведут в handlers/admin_menu_visibility.py
         [InlineKeyboardButton(text="🧩 Настройки меню", callback_data="menuvis:roles")],
         [InlineKeyboardButton(text="⬅️ Назад в меню", callback_data="back_to_menu")],
     ])
@@ -107,7 +104,7 @@ def kb_prod_pick(products: List[Product]) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"{p.name} (арт. {p.article}) {'✅' if p.is_active else '🚫'}", callback_data=f"adm_prod_pick:{p.id}")]
         for p in products
     ])
-    kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_product_edit")])
+    kb.inline_keyboard.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_prod")])
     return kb
 
 def kb_prod_actions(p: Product) -> InlineKeyboardMarkup:
@@ -116,7 +113,7 @@ def kb_prod_actions(p: Product) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=("🟢 Активировать" if not p.is_active else "🔴 Деактивировать"),
                               callback_data=f"adm_prod_toggle:{p.id}")],
         [InlineKeyboardButton(text="🗑 Удалить", callback_data=f"adm_prod_del:{p.id}")],
-        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_product_edit")],
+        InlineKeyboardButton(text="⬅️ Назад", callback_data="admin_prod"),
     ])
 
 def kb_back(data: str) -> InlineKeyboardMarkup:
@@ -492,7 +489,9 @@ async def admin_prod_root(cb: types.CallbackQuery, user: User, state: FSMContext
     if user.role != UserRole.admin:
         await cb.answer("Доступ запрещен.", show_alert=True); return
     await cb.answer()
+    await state.clear()   # сбрасываем FSM
     await send_content(cb, "Товары: выберите действие", reply_markup=kb_admin_prod_root())
+
 
 async def admin_product_add(cb: types.CallbackQuery, user: User, state: FSMContext):
     if user.role != UserRole.admin:

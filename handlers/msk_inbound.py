@@ -11,7 +11,6 @@ from sqlalchemy import select, func
 
 from database.db import get_session
 from database.models import (
-    # enums / models
     MovementType, ProductStage,
     CnPurchase, CnPurchaseStatus,
     MskInboundDoc, MskInboundItem, MskInboundStatus,
@@ -19,7 +18,6 @@ from database.models import (
 )
 
 router = Router()
-
 
 # ========= safe edit =========
 async def safe_edit_text(msg: Message, text: str):
@@ -29,8 +27,8 @@ async def safe_edit_text(msg: Message, text: str):
         if "message is not modified" in str(e):
             pass
         else:
-            raise
-
+            # если сообщение нельзя редактировать — отправим новое
+            await msg.answer(text)
 
 async def safe_edit_reply_markup(msg: Message, markup: InlineKeyboardMarkup | None):
     try:
@@ -39,19 +37,17 @@ async def safe_edit_reply_markup(msg: Message, markup: InlineKeyboardMarkup | No
         if "message is not modified" in str(e):
             pass
         else:
-            raise
-
+            if markup:
+                await msg.answer("⬇️", reply_markup=markup)
 
 # ========= helpers =========
 _re_int = re.compile(r"(\d+)")
-
 
 def last_int(data: str) -> Optional[int]:
     if not data:
         return None
     m = _re_int.findall(data)
     return int(m[-1]) if m else None
-
 
 def last_two_ints(data: str) -> Tuple[Optional[int], Optional[int]]:
     if not data:
@@ -63,6 +59,8 @@ def last_two_ints(data: str) -> Tuple[Optional[int], Optional[int]]:
         return None, int(m[0])
     return int(m[-2]), int(m[-1])
 
+def fmt_dt(dt: datetime | None) -> str:
+    return dt.strftime("%d.%m.%Y %H:%M") if dt else "—"
 
 # ========= keyboards =========
 def msk_root_kb() -> InlineKeyboardMarkup:
@@ -73,9 +71,13 @@ def msk_root_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⬅️ Назад",                  callback_data="back_to_menu")],
     ])
 
-
-def msk_doc_kb(msk_id: int, status: MskInboundStatus, warehouse_id: Optional[int]) -> InlineKeyboardMarkup:
+def msk_doc_kb(msk_id: int, status: MskInboundStatus, warehouse_id: Optional[int], cn_id: Optional[int]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
+
+    # Фото CN — доступ к фото исходной закупки
+    if cn_id:
+        rows.append([InlineKeyboardButton(text="👀 Фото CN", callback_data=f"cn:photos:{cn_id}:1")])
+
     if status == MskInboundStatus.PENDING and not warehouse_id:
         rows.append([InlineKeyboardButton(
             text="➡️ Перевести: Доставка на наш склад",
@@ -86,9 +88,9 @@ def msk_doc_kb(msk_id: int, status: MskInboundStatus, warehouse_id: Optional[int
             text="✅ Принято (оприходовать)",
             callback_data=f"msk:deliver:{msk_id}"
         )])
+
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="msk:root")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
-
 
 def msk_wh_kb(msk_id: int, warehouses: list[Warehouse]) -> InlineKeyboardMarkup:
     buttons: list[list[InlineKeyboardButton]] = []
@@ -97,20 +99,17 @@ def msk_wh_kb(msk_id: int, warehouses: list[Warehouse]) -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="⬅️ Отмена", callback_data=f"msk:open:{msk_id}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-
 # ========= entry =========
 @router.message(F.text == "Склад МСК")
 async def msk_entry(msg: Message):
     await msg.answer("Раздел «Склад МСК».", reply_markup=None)
     await msg.answer("Выберите:", reply_markup=msk_root_kb())
 
-
 @router.callback_query(F.data == "msk:root")
 async def msk_root(cb: CallbackQuery):
     await safe_edit_text(cb.message, "Раздел «Склад МСК».")
     await safe_edit_reply_markup(cb.message, msk_root_kb())
     await cb.answer()
-
 
 # ========= lists =========
 @router.callback_query(F.data.startswith("msk:list:"))
@@ -149,7 +148,6 @@ async def msk_list(cb: CallbackQuery):
     await safe_edit_reply_markup(cb.message, InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await cb.answer()
 
-
 # ========= open doc =========
 async def _fetch_msk_view(msk_id: int):
     async with get_session() as s:
@@ -162,13 +160,15 @@ async def _fetch_msk_view(msk_id: int):
             prows = (await s.execute(select(Product).where(Product.id.in_(pids)))).scalars().all()
             pmap = {p.id: p for p in prows}
 
-        wh_name = msk.warehouse.name if msk.warehouse else None
+        wh_name = msk.warehouse.name if msk and msk.warehouse else None
 
     return msk, items, pmap, wh_name
 
-
 async def render_msk_doc(msg: Message, msk_id: int):
     msk, items, pmap, wh_name = await _fetch_msk_view(msk_id)
+    if not msk:
+        await safe_edit_text(msg, "Документ не найден или удалён.")
+        return
 
     if msk.status == MskInboundStatus.PENDING and not msk.warehouse_id:
         status_text = "🚚 Доставка в РФ"
@@ -181,6 +181,7 @@ async def render_msk_doc(msg: Message, msk_id: int):
         f"📦 MSK-док #{msk.id} (из CN #{msk.cn_purchase_id})",
         f"Статус: {status_text}",
         f"Склад назначения: {wh_name or '—'}",
+        f"💬 Комментарий: {getattr(msk, 'comment', None) or '—'}",
         "",
         "🧱 Позиции:",
     ]
@@ -190,11 +191,20 @@ async def render_msk_doc(msg: Message, msk_id: int):
         for it in items:
             p = pmap.get(it.product_id)
             title = f"{p.name} · {p.article}" if p else f"id={it.product_id}"
-            lines.append(f"• {title} — {it.qty} шт. × {it.unit_cost_rub} ₽")
+            price = f"{(it.unit_cost_rub or 0):.2f}"
+            lines.append(f"• {title} — {it.qty} шт. × {price} ₽")
+
+    # Таймлайн — ВСЕГДА
+    lines += [
+        "",
+        "🕓 Хронология:",
+        f"• Создан: {fmt_dt(getattr(msk, 'created_at', None))}",
+        f"• Выбран склад: {fmt_dt(getattr(msk, 'to_our_at', None))}",
+        f"• Принято (оприходовано): {fmt_dt(getattr(msk, 'received_at', None))}",
+    ]
 
     await safe_edit_text(msg, "\n".join(lines))
-    await safe_edit_reply_markup(msg, msk_doc_kb(msk.id, msk.status, msk.warehouse_id))
-
+    await safe_edit_reply_markup(msg, msk_doc_kb(msk.id, msk.status, msk.warehouse_id, msk.cn_purchase_id))
 
 @router.callback_query(F.data.startswith("msk:open:"))
 async def msk_open(cb: CallbackQuery):
@@ -218,7 +228,6 @@ async def msk_open(cb: CallbackQuery):
     await render_msk_doc(cb.message, msk_id)
     await cb.answer()
 
-
 # ========= choose target warehouse =========
 @router.callback_query(F.data.startswith("msk:to_our:"))
 async def msk_to_our(cb: CallbackQuery):
@@ -237,7 +246,6 @@ async def msk_to_our(cb: CallbackQuery):
     await safe_edit_reply_markup(cb.message, msk_wh_kb(msk_id, warehouses))
     await cb.answer()
 
-
 @router.callback_query(F.data.startswith("msk:whchoose:"))
 async def msk_whchoose(cb: CallbackQuery):
     msk_id, wh_id = last_two_ints(cb.data)
@@ -252,10 +260,13 @@ async def msk_whchoose(cb: CallbackQuery):
             return
 
         msk = await s.get(MskInboundDoc, msk_id)
-        # сохраняем выбор склада (в модели это поле warehouse_id, в БД колонка target_warehouse_id)
+        # сохраняем выбор склада
         msk.warehouse_id = wh_id
+        # таймстемп выбора склада (новое поле)
+        if not getattr(msk, "to_our_at", None):
+            msk.to_our_at = datetime.utcnow()
 
-        # CN → Архив (как вы и хотели, после выбора склада)
+        # CN → Архив при выборе склада
         cn = await s.get(CnPurchase, msk.cn_purchase_id)
         cn.status = CnPurchaseStatus.DELIVERED_TO_MSK
         if hasattr(cn, "archived_at"):
@@ -265,7 +276,6 @@ async def msk_whchoose(cb: CallbackQuery):
 
     await render_msk_doc(cb.message, msk_id)
     await cb.answer("Склад выбран. Теперь нажмите «✅ Принято (оприходовать)».", show_alert=True)
-
 
 # ========= deliver (create stock movements) =========
 @router.callback_query(F.data.startswith("msk:deliver:"))
@@ -308,7 +318,7 @@ async def msk_deliver(cb: CallbackQuery):
 
         # комментарий для поступления
         base_comment = "Оприходовано со склада МСК"
-        comment_full = f"{base_comment}: MSK #{msk.id} (из CN #{msk.cn_purchase_id})"
+        comment_full = f"{base_comment}: MSK #{msk.id} (из CN #{msk.cn_purchase_id})".strip()
 
         # создаём движения
         now = datetime.utcnow()
