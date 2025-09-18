@@ -12,7 +12,8 @@ from sqlalchemy import select, func
 from database.db import get_session
 from database.models import (
     MovementType, ProductStage,
-    CnPurchase, CnPurchaseStatus,
+    CnPurchase,  # подтягиваем даты для таймлайна
+    CnPurchaseStatus,
     MskInboundDoc, MskInboundItem, MskInboundStatus,
     Warehouse, Product, StockMovement, User,
 )
@@ -27,7 +28,6 @@ async def safe_edit_text(msg: Message, text: str):
         if "message is not modified" in str(e):
             pass
         else:
-            # если сообщение нельзя редактировать — отправим новое
             await msg.answer(text)
 
 async def safe_edit_reply_markup(msg: Message, markup: InlineKeyboardMarkup | None):
@@ -74,7 +74,6 @@ def msk_root_kb() -> InlineKeyboardMarkup:
 def msk_doc_kb(msk_id: int, status: MskInboundStatus, warehouse_id: Optional[int], cn_id: Optional[int]) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
 
-    # Фото CN — доступ к фото исходной закупки
     if cn_id:
         rows.append([InlineKeyboardButton(text="👀 Фото CN", callback_data=f"cn:photos:{cn_id}:1")])
 
@@ -162,10 +161,13 @@ async def _fetch_msk_view(msk_id: int):
 
         wh_name = msk.warehouse.name if msk and msk.warehouse else None
 
-    return msk, items, pmap, wh_name
+        # подтягиваем связанный CN для таймлайна
+        cn = await s.get(CnPurchase, msk.cn_purchase_id) if msk else None
+
+    return msk, items, pmap, wh_name, cn
 
 async def render_msk_doc(msg: Message, msk_id: int):
-    msk, items, pmap, wh_name = await _fetch_msk_view(msk_id)
+    msk, items, pmap, wh_name, cn = await _fetch_msk_view(msk_id)
     if not msk:
         await safe_edit_text(msg, "Документ не найден или удалён.")
         return
@@ -194,13 +196,16 @@ async def render_msk_doc(msg: Message, msk_id: int):
             price = f"{(it.unit_cost_rub or 0):.2f}"
             lines.append(f"• {title} — {it.qty} шт. × {price} ₽")
 
-    # Таймлайн — ВСЕГДА
+    # Полная хронология (как в CN: 1–6)
     lines += [
         "",
         "🕓 Хронология:",
-        f"• Создан: {fmt_dt(getattr(msk, 'created_at', None))}",
-        f"• Выбран склад: {fmt_dt(getattr(msk, 'to_our_at', None))}",
-        f"• Принято (оприходовано): {fmt_dt(getattr(msk, 'received_at', None))}",
+        f"1) Создан: {fmt_dt(getattr(cn, 'created_at', None))}",
+        f"2) Отправлен в карго: {fmt_dt(getattr(cn, 'sent_to_cargo_at', None))}",
+        f"3) Переведён в отправку на склад МСК: {fmt_dt(getattr(cn, 'sent_to_msk_at', None))}",
+        f"4) Отправлен на региональный склад: {fmt_dt(getattr(msk, 'to_our_at', None))}",
+        f"5) Приходован на склад: {fmt_dt(getattr(msk, 'received_at', None))}",
+        f"6) Архивирован: {fmt_dt(getattr(cn, 'archived_at', None))}",
     ]
 
     await safe_edit_text(msg, "\n".join(lines))
@@ -260,13 +265,11 @@ async def msk_whchoose(cb: CallbackQuery):
             return
 
         msk = await s.get(MskInboundDoc, msk_id)
-        # сохраняем выбор склада
         msk.warehouse_id = wh_id
-        # таймстемп выбора склада (новое поле)
         if not getattr(msk, "to_our_at", None):
             msk.to_our_at = datetime.utcnow()
 
-        # CN → Архив при выборе склада
+        # Архивируем CN при выборе склада (как и раньше)
         cn = await s.get(CnPurchase, msk.cn_purchase_id)
         cn.status = CnPurchaseStatus.DELIVERED_TO_MSK
         if hasattr(cn, "archived_at"):
@@ -286,7 +289,6 @@ async def msk_deliver(cb: CallbackQuery):
         return
 
     async with get_session() as s:
-        # MSK-док + проверки
         msk = await s.get(MskInboundDoc, msk_id)
         if not msk:
             await cb.answer("Документ не найден.", show_alert=True)
@@ -295,13 +297,11 @@ async def msk_deliver(cb: CallbackQuery):
             await cb.answer("Не выбран склад назначения.", show_alert=True)
             return
 
-        # кто принял (по Telegram ID)
         db_user = (await s.execute(
             select(User).where(User.telegram_id == cb.from_user.id)
         )).scalar_one_or_none()
         user_id = db_user.id if db_user else None
 
-        # все позиции MSK-дока
         items = (await s.execute(
             select(MskInboundItem).where(MskInboundItem.msk_inbound_id == msk_id)
         )).scalars().all()
@@ -310,17 +310,14 @@ async def msk_deliver(cb: CallbackQuery):
             await cb.answer("В документе нет позиций.", show_alert=True)
             return
 
-        # общий номер документа «Поступление»
         max_doc = (await s.execute(
             select(func.max(StockMovement.doc_id)).where(StockMovement.type == MovementType.prihod)
         )).scalar()
         next_doc = (max_doc or 0) + 1
 
-        # комментарий для поступления
         base_comment = "Оприходовано со склада МСК"
         comment_full = f"{base_comment}: MSK #{msk.id} (из CN #{msk.cn_purchase_id})".strip()
 
-        # создаём движения
         now = datetime.utcnow()
         for it in items:
             s.add(StockMovement(
@@ -331,11 +328,10 @@ async def msk_deliver(cb: CallbackQuery):
                 warehouse_id=msk.warehouse_id,
                 date=now,
                 user_id=user_id,
-                doc_id=next_doc,          # общий doc_id для всех позиций
+                doc_id=next_doc,
                 comment=comment_full,
             ))
 
-        # Архивируем MSK-док
         msk.status = MskInboundStatus.RECEIVED
         msk.received_at = now
         msk.received_by_user_id = user_id

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from typing import Optional, Tuple, List
 
 from aiogram import Router, F
@@ -22,7 +23,7 @@ from database.models import (
     Product,
 )
 
-# ---- опциональная модель фото (не ломаем запуск, если миграции ещё нет) ----
+# ---- опциональная модель фото ----
 try:
     from database.models import CnPurchasePhoto  # id, cn_purchase_id, file_id, caption, uploaded_at, uploaded_by_user_id
     HAS_PHOTO_MODEL = True
@@ -41,7 +42,6 @@ async def safe_edit_text(msg: Message, text: str):
         if "message is not modified" in str(e):
             pass
         else:
-            # если сообщение уже не редактируемо — отправим новое
             await msg.answer(text)
 
 async def safe_edit_reply_markup(msg: Message, markup: InlineKeyboardMarkup | None):
@@ -58,10 +58,8 @@ async def safe_edit_reply_markup(msg: Message, markup: InlineKeyboardMarkup | No
 def fmt_dt(dt: datetime | None) -> str:
     if not dt:
         return "—"
-    # локально: DD.MM.YYYY HH:MM
     return dt.strftime("%d.%m.%Y %H:%M")
 
-# -------- cb parsers ----------
 _re_int = re.compile(r"(\d+)")
 
 def last_int(data: str) -> Optional[int]:
@@ -103,7 +101,7 @@ def cn_root_kb() -> InlineKeyboardMarkup:
 def cn_doc_actions_kb(doc_id: int, status: CnPurchaseStatus, photos_cnt: int | None = None) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
 
-    # Фото — всегда доступен просмотр; добавление — пока не архив
+    # Фото — просмотр всегда; добавление — пока не архив
     label = "🖼 Фото" if photos_cnt is None else f"🖼 Фото ({photos_cnt})"
     rows.append([InlineKeyboardButton(text=label, callback_data=f"cn:photos:{doc_id}:1")])
     if status != CnPurchaseStatus.DELIVERED_TO_MSK:
@@ -119,9 +117,6 @@ def cn_doc_actions_kb(doc_id: int, status: CnPurchaseStatus, photos_cnt: int | N
     elif status == CnPurchaseStatus.SENT_TO_MSK:
         rows.append([InlineKeyboardButton(text="🏢 Открыть в «Склад МСК»", callback_data=f"msk:open:by_cn:{doc_id}")])
         rows.append([InlineKeyboardButton(text="✏️ Комментарий", callback_data=f"cn:comment:edit:{doc_id}")])
-    else:
-        # Архив CN — только просмотр
-        pass
 
     rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="cn:root")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -227,7 +222,6 @@ async def cn_new(cb: CallbackQuery, state: FSMContext):
     code = "CN-" + datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     async with get_session() as s:
         doc = CnPurchase(code=code, status=CnPurchaseStatus.SENT_TO_CARGO, comment=None)
-        # таймстемпы
         if hasattr(doc, "sent_to_cargo_at"):
             doc.sent_to_cargo_at = datetime.utcnow()
         s.add(doc)
@@ -301,7 +295,11 @@ async def cn_item_qty(msg: Message, state: FSMContext):
     if not txt.isdigit():
         await msg.answer("Некорректное число. Введите количество единиц (шт.).")
         return
-    await state.update_data(qty=int(txt))
+    qty = int(txt)
+    if qty <= 0:
+        await msg.answer("Количество должно быть больше 0.")
+        return
+    await state.update_data(qty=qty)
     await msg.answer("Введите стоимость единицы товара (₽).")
     await state.set_state(CnCreateState.waiting_cost)
 
@@ -309,9 +307,12 @@ async def cn_item_qty(msg: Message, state: FSMContext):
 async def cn_item_cost(msg: Message, state: FSMContext):
     raw = msg.text.replace(",", ".").strip()
     try:
-        cost = float(raw)
-    except Exception:
+        cost = Decimal(raw)
+    except (InvalidOperation, ValueError):
         await msg.answer("Некорректная цена. Введите стоимость единицы товара (₽).")
+        return
+    if cost <= 0:
+        await msg.answer("Цена должна быть больше 0.")
         return
 
     await state.update_data(cost=cost)
@@ -324,7 +325,7 @@ async def cn_item_cost(msg: Message, state: FSMContext):
         "Добавляем позицию:\n"
         f"• {name}\n"
         f"• Кол-во: {data['qty']} шт.\n"
-        f"• Цена: {data['cost']} ₽\n\n"
+        f"• Цена: {data['cost']:.2f} ₽\n\n"
         "Выберите действие:"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -339,12 +340,22 @@ async def cn_item_cost(msg: Message, state: FSMContext):
 async def _commit_item(state: FSMContext):
     data = await state.get_data()
     async with get_session() as s:
-        s.add(CnPurchaseItem(
-            cn_purchase_id=data["cn_doc_id"],
-            product_id=data["selected_product_id"],
-            qty=data["qty"],
-            unit_cost_rub=data["cost"],
-        ))
+        existing = (await s.execute(
+            select(CnPurchaseItem).where(
+                (CnPurchaseItem.cn_purchase_id == data["cn_doc_id"]) &
+                (CnPurchaseItem.product_id == data["selected_product_id"]) &
+                (CnPurchaseItem.unit_cost_rub == data["cost"])
+            )
+        )).scalar_one_or_none()
+        if existing:
+            existing.qty = existing.qty + data["qty"]
+        else:
+            s.add(CnPurchaseItem(
+                cn_purchase_id=data["cn_doc_id"],
+                product_id=data["selected_product_id"],
+                qty=data["qty"],
+                unit_cost_rub=data["cost"],
+            ))
         await s.commit()
 
 @router.callback_query(F.data == "cn:item:commit:add_more")
@@ -382,10 +393,14 @@ async def _fetch_cn_view(doc_id: int):
             photos_cnt = (await s.execute(
                 select(func.count()).select_from(CnPurchasePhoto).where(CnPurchasePhoto.cn_purchase_id == doc_id)
             )).scalar_one()
-    return doc, items, pmap, photos_cnt
+        # связанный MSK-док (для шагов 4–5)
+        msk = (await s.execute(select(MskInboundDoc).where(MskInboundDoc.cn_purchase_id == doc_id))).scalar_one_or_none()
+        msk_to_our_at = getattr(msk, "to_our_at", None) if msk else None
+        msk_received_at = getattr(msk, "received_at", None) if msk else None
+    return doc, items, pmap, photos_cnt, msk_to_our_at, msk_received_at
 
 async def render_doc(msg: Message, doc_id: int):
-    doc, items, pmap, photos_cnt = await _fetch_cn_view(doc_id)
+    doc, items, pmap, photos_cnt, msk_to_our_at, msk_received_at = await _fetch_cn_view(doc_id)
 
     lines = [
         f"📄 {doc.code} — {doc.status.value}",
@@ -400,29 +415,55 @@ async def render_doc(msg: Message, doc_id: int):
         for it in items:
             p = pmap.get(it.product_id)
             title = f"{p.name} · {p.article}" if p else f"id={it.product_id}"
-            price = f"{(it.unit_cost_rub or 0):.2f}"
+            price = f"{(it.unit_cost_rub or Decimal('0')):.2f}"
             lines.append(f"• {title} — {it.qty} шт. × {price} ₽")
 
-    # Хронология показывается ВСЕГДА (и в карточке, и в архиве)
+    # Полная хронология (1–6)
+    created_at        = fmt_dt(getattr(doc, 'created_at', None))
+    sent_to_cargo_at  = fmt_dt(getattr(doc, 'sent_to_cargo_at', None))
+    sent_to_msk_at    = fmt_dt(getattr(doc, 'sent_to_msk_at', None))
+    to_our_at_txt     = fmt_dt(msk_to_our_at)        # 4) Отправлен на региональный склад
+    received_at_txt   = fmt_dt(msk_received_at)      # 5) Приходован на склад
+    archived_at       = fmt_dt(getattr(doc, 'archived_at', None))
+
     lines += [
         "",
         "🕓 Хронология:",
-        f"• Создан: {fmt_dt(getattr(doc, 'created_at', None))}",
-        f"• Передан на доставку в карго: {fmt_dt(getattr(doc, 'sent_to_cargo_at', None))}",
-        f"• Передан на доставку на склад МСК: {fmt_dt(getattr(doc, 'sent_to_msk_at', None))}",
-        f"• Архивирован: {fmt_dt(getattr(doc, 'archived_at', None))}",
+        f"1) Создан: {created_at}",
+        f"2) Отправлен в карго: {sent_to_cargo_at}",
+        f"3) Переведён в отправку на склад МСК: {sent_to_msk_at}",
+        f"4) Отправлен на региональный склад: {to_our_at_txt}",
+        f"5) Приходован на склад: {received_at_txt}",
+        f"6) Архивирован: {archived_at}",
     ]
 
     await safe_edit_text(msg, "\n".join(lines))
     await safe_edit_reply_markup(msg, cn_doc_actions_kb(doc_id, doc.status, photos_cnt))
 
-@router.callback_query(F.data.startswith("cn:open:"))
+@router.callback_query(F.data.startswith("cn:open"))
 async def cn_open(cb: CallbackQuery):
+    """
+    Универсальный open:
+    - ловит и 'cn:open:123', и случайные вариации 'cn:open'
+    - если нажато под медиа — удаляет медиа и присылает карточку
+    """
     doc_id = last_int(cb.data)
     if not doc_id:
-        await cb.answer("Не удалось определить документ.", show_alert=True)
+        await cb.answer("Не удалось определить документ (нет ID).", show_alert=True)
         return
-    await render_doc(cb.message, doc_id)
+
+    # если кнопка под медиа — удаляем сообщение с медиа
+    if getattr(cb.message, "photo", None) or getattr(cb.message, "video", None) \
+            or getattr(cb.message, "animation", None) or getattr(cb.message, "document", None):
+        try:
+            await cb.message.delete()
+        except TelegramBadRequest:
+            pass
+        out = await cb.message.answer("Открываю документ…")
+        await render_doc(out, doc_id)
+    else:
+        await render_doc(cb.message, doc_id)
+
     await cb.answer()
 
 @router.callback_query(F.data.startswith("cn:comment:edit:"))
@@ -510,10 +551,10 @@ async def cn_photo_add_entry(cb: CallbackQuery, state: FSMContext):
         return
     await state.update_data(cn_doc_id=doc_id)
     await state.set_state(CnCreateState.uploading_photos)
-    await safe_edit_text(cb.message, "Загрузите 1–N фото (изображениями). Когда закончите — отправьте «Готово».")
-    await safe_edit_reply_markup(cb.message, InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад к документу", callback_data=f"cn:open:{doc_id}")]]
-    ))
+    await safe_edit_text(cb.message, "Загрузите 1–N фото (изображениями).")
+    await safe_edit_reply_markup(cb.message, InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Назад к документу", callback_data=f"cn:open:{doc_id}")],
+    ]))
     await cb.answer()
 
 @router.message(CnCreateState.uploading_photos, F.photo)
@@ -526,6 +567,7 @@ async def cn_photo_save(msg: Message, state: FSMContext):
     if not doc_id:
         await msg.answer("Сессия потеряна. Откройте документ заново.")
         return
+
     file_id = msg.photo[-1].file_id
     caption = (msg.caption or "").strip() or None
     async with get_session() as s:
@@ -537,52 +579,93 @@ async def cn_photo_save(msg: Message, state: FSMContext):
             uploaded_by_user_id=None,
         ))
         await s.commit()
-    await msg.answer("✅ Фото сохранено. Можете добавить ещё или отправьте «Готово».")
 
-@router.message(CnCreateState.uploading_photos, F.text.casefold() == "готово")
-async def cn_photo_done(msg: Message, state: FSMContext):
-    doc_id = (await state.get_data()).get("cn_doc_id")
+    # после сохранения отправляем НАШЕ фото с кнопками
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить ещё фото", callback_data=f"cn:photo:more:{doc_id}")],
+        [InlineKeyboardButton(text="✅ Готово", callback_data=f"cn:photo:done:{doc_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад к документу", callback_data=f"cn:open:{doc_id}")],
+    ])
+    await msg.answer_photo(file_id, caption=caption or "", reply_markup=kb)
+
+@router.callback_query(F.data.startswith("cn:photo:more:"))
+async def cn_photo_more(cb: CallbackQuery, state: FSMContext):
+    """Удаляем превью с кнопками и остаёмся в режиме загрузки — просим прислать следующее фото."""
+    doc_id = last_int(cb.data)
+    if not doc_id:
+        await cb.answer("Документ не найден.", show_alert=True)
+        return
+
+    # удалить наше превью с кнопками
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
+
+    # остаёмся в состоянии uploading_photos
+    await state.update_data(cn_doc_id=doc_id)
+    await state.set_state(CnCreateState.uploading_photos)
+    await cb.message.answer("Фото сохранено. Пришлите следующее фото или нажмите «⬅️ Назад к документу».")
+    await cb.answer("Ок, ждём следующее фото.")
+
+@router.callback_query(F.data.startswith("cn:photo:done:"))
+async def cn_photo_done_btn(cb: CallbackQuery, state: FSMContext):
+    doc_id = last_int(cb.data)
+    if not doc_id:
+        await cb.answer("Документ не найден.", show_alert=True)
+        return
+
     await state.clear()
-    out = await msg.answer("Готово. Открываю документ…")
+
+    # закрываем (удаляем) наше сообщение с фото/кнопками и возвращаемся в карточку
+    try:
+        await cb.message.delete()
+    except TelegramBadRequest:
+        pass
+
+    out = await cb.message.answer("Готово. Открываю документ…")
     await render_doc(out, doc_id)
+    await cb.answer("Готово.")
 
 @router.callback_query(F.data.startswith("cn:photos:"))
 async def cn_photos_view(cb: CallbackQuery):
+    # формат: cn:photos:{cn_id}:{page}
     if not HAS_PHOTO_MODEL:
         await cb.answer("Модуль фото не активирован (нужна миграция).", show_alert=True)
         return
-    doc_id, page = last_two_ints(cb.data)
-    if not doc_id or not page:
+    cn_id, page = last_two_ints(cb.data)
+    if not cn_id or not page:
         await cb.answer("Параметры не распознаны.", show_alert=True)
         return
 
     async with get_session() as s:
-        base_q = select(CnPurchasePhoto).where(CnPurchasePhoto.cn_purchase_id == doc_id).order_by(CnPurchasePhoto.uploaded_at.asc())
+        base_q = select(CnPurchasePhoto).where(CnPurchasePhoto.cn_purchase_id == cn_id).order_by(CnPurchasePhoto.uploaded_at.asc())
         total = (await s.execute(select(func.count()).select_from(base_q.subquery()))).scalar_one()
-        rows = (await s.execute(base_q.offset((page - 1) * PHOTO_PAGE).limit(PHOTO_PAGE))).scalars().all()
+        # одна фотка на страницу
+        row = (await s.execute(base_q.offset(page - 1).limit(1))).scalar_one_or_none()
 
-    if not rows:
+    if not row:
         await cb.answer("Фото отсутствуют.")
         return
 
-    if len(rows) == 1:
-        await cb.message.answer_photo(rows[0].file_id, caption=rows[0].caption or "")
-    else:
-        media = [InputMediaPhoto(media=r.file_id, caption=r.caption or "") for r in rows]
-        await cb.message.answer_media_group(media)
-
     prev_page = page - 1 if page > 1 else None
-    next_page = page + 1 if page * PHOTO_PAGE < total else None
-    nav: list[list[InlineKeyboardButton]] = []
-    buttons: list[InlineKeyboardButton] = []
+    next_page = page + 1 if page < total else None
+
+    # клавиатура под фото: навигация, «Назад к документу», «Готово»
+    buttons: list[list[InlineKeyboardButton]] = []
+    nav_row: list[InlineKeyboardButton] = []
     if prev_page:
-        buttons.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cn:photos:{doc_id}:{prev_page}"))
+        nav_row.append(InlineKeyboardButton(text="⬅️ Назад", callback_data=f"cn:photos:{cn_id}:{prev_page}"))
     if next_page:
-        buttons.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"cn:photos:{doc_id}:{next_page}"))
-    if buttons:
-        nav.append(buttons)
-    nav.append([InlineKeyboardButton(text="⬅️ К документу", callback_data=f"cn:open:{doc_id}")])
-    await safe_edit_reply_markup(cb.message, InlineKeyboardMarkup(inline_keyboard=nav))
+        nav_row.append(InlineKeyboardButton(text="Вперёд ➡️", callback_data=f"cn:photos:{cn_id}:{next_page}"))
+    if nav_row:
+        buttons.append(nav_row)
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад к документу", callback_data=f"cn:open:{cn_id}")])
+    buttons.append([InlineKeyboardButton(text="✅ Готово", callback_data=f"cn:photo:done:{cn_id}")])
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    # отправляем фото с inline-клавиатурой
+    await cb.message.answer_photo(row.file_id, caption=row.caption or "", reply_markup=kb)
     await cb.answer()
 
 # -------- register --------

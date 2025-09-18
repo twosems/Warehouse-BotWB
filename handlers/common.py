@@ -180,7 +180,9 @@ async def cmd_start(message: types.Message, bot: Bot):
                     await session.commit()
 
             set_audit_user(admin_user.id)
-            await message.answer("Главное меню:", reply_markup=await get_main_menu(UserRole.admin))
+            # ЕДИНЫЙ заголовок и меню в зависимости от роли
+            caption = await _root_caption_for_role(UserRole.admin)
+            await message.answer(caption, reply_markup=await get_main_menu(UserRole.admin))
             return
 
         except Exception:
@@ -202,7 +204,9 @@ async def cmd_start(message: types.Message, bot: Bot):
 
     if user:
         set_audit_user(user.id)
-        await message.answer("Главное меню:", reply_markup=await get_main_menu(user.role))
+        # ЕДИНЫЙ заголовок и меню в зависимости от роли
+        caption = await _root_caption_for_role(user.role)
+        await message.answer(caption, reply_markup=await get_main_menu(user.role))
         return
 
     # Заявка админу
@@ -221,9 +225,76 @@ async def cmd_start(message: types.Message, bot: Bot):
     await message.answer("Ваш запрос отправлен администратору. Ожидайте одобрения.")
 
 
-# ---------------------------
-# Approve / Reject
-# ---------------------------
+async def _root_caption_for_role(role: UserRole) -> str:
+    """Красивый и информативный заголовок главного меню с описанием разделов по доступам роли."""
+    async with get_session() as session:
+        visible = set(await get_visible_menu_items_for_role(session, role))
+
+    lines: list[str] = []
+
+    # Заголовок
+    role_map = {
+        UserRole.admin: "Администратор",
+        UserRole.user: "Пользователь",
+        UserRole.manager: "Менеджер",
+    }
+    role_name = role_map.get(role, str(role).title())
+    lines.append(f"🌿 *Главное меню*  ·  роль: *{role_name}*")
+
+    # Подсказка
+    lines.append("Выберите раздел ниже — кратко, что внутри:")
+
+    # Закупки / Поступления
+    if any(it in visible for it in PROCURE_GROUP):
+        lines += [
+            "",
+            "🧾 *Закупки и поступления*",
+            " • Приём товара на склад с комментарием и аудитом.",
+            " • Корректировки остатков (дельта/новое количество, причина).",
+            " • Быстрый просмотр текущих остатков по складам и товарам.",
+        ]
+
+    # Упаковка / Поставки
+    if any(it in visible for it in PACK_GROUP):
+        lines += [
+            "",
+            "📦 *Упаковка и поставки*",
+            " • Формирование поставок: выбор склада-источника и товаров.",
+            " • Контроль лимитов: нельзя списать больше остатка.",
+            " • Экспорт в Google Sheets и отправка менеджеру на подтверждение.",
+            " • История поставок и статусы (сборка/подтверждение).",
+        ]
+
+    # Отчёты
+    if any(mi.name == "reports" for mi in visible):
+        lines += [
+            "",
+            "📈 *Отчёты*",
+            " • Остатки на дату, движения и история операций.",
+            " • Фильтры по складу/товару/периоду, экспорт в Google Sheets.",
+            " • Уведомления о низких остатках (настраиваемые пороги).",
+        ]
+
+    # Администрирование
+    if any(mi.name == "admin" for mi in visible):
+        lines += [
+            "",
+            "⚙️ *Администрирование*",
+            " • Пользователи и роли, видимость пунктов меню.",
+            " • Справочники: товары, склады и настройки системы.",
+            " • Журнал действий и служебные операции.",
+        ]
+
+    # Хвостовая подсказка
+    lines += [
+        "",
+        "ℹ️ Подсказка: используйте *кнопки меню* ниже. Для возврата — нажмите «Назад».",
+    ]
+
+    return "\n".join(lines)
+
+
+
 async def handle_admin_decision(cb: types.CallbackQuery, bot: Bot):
     try:
         action, uid_str = cb.data.split(":")
@@ -287,37 +358,30 @@ async def on_otchety(cb: types.CallbackQuery, user: User):
     await cb.answer()
     await send_content(cb, "«Отчёты»: модуль в разработке.")
 
+
 async def back_to_main_menu(cb: types.CallbackQuery, user: User, state: FSMContext):
     await cb.answer()
     if state:
         await state.clear()
-    # Не создаём новое сообщение, а переиспользуем текущее
-    await cb.message.edit_text("Главное меню:", reply_markup=await get_main_menu(user.role))
+    # ЕДИНЫЙ заголовок и меню
+    caption = await _root_caption_for_role(user.role)
+    try:
+        await cb.message.edit_text(caption, reply_markup=await get_main_menu(user.role))
+    except Exception:
+        await cb.message.answer(caption, reply_markup=await get_main_menu(user.role))
 
 
 # ---------------------------
 # Навигация по корневым категориям (с описаниями)
 # ---------------------------
 async def show_root_menu(cb: types.CallbackQuery, user: User):
-    """Корневое меню: 2 категории + Отчёты + Администрирование (если разрешены) с описаниями."""
+    """Корневое меню: 2 категории + Отчёты + Администрирование (если разрешены) — с единым заголовком."""
     await cb.answer()
-
-    # Проверяем, какие пункты доступны роли
-    async with get_session() as session:
-        visible = set(await get_visible_menu_items_for_role(session, user.role))
-
-    lines = ["Главное меню:"]
-    if any(it in visible for it in PROCURE_GROUP):
-        lines.append("🧾 Закупки-поступления — операции закупки и поступлений.")
-    if any(it in visible for it in PACK_GROUP):
-        lines.append("📦 Упаковка-поставки — упаковка, поставки и сборка.")
-    # одиночные верхнего уровня
-    if any(mi.name == "reports" for mi in visible):
-        lines.append("📈 Отчёты — формирование аналитических отчётов.")
-    if any(mi.name == "admin" for mi in visible):
-        lines.append("⚙️ Администрирование — управление пользователями, складами и настройками.")
-
-    await cb.message.edit_text("\n".join(lines), reply_markup=await get_main_menu(user.role))
+    caption = await _root_caption_for_role(user.role)
+    try:
+        await cb.message.edit_text(caption, reply_markup=await get_main_menu(user.role))
+    except Exception:
+        await cb.message.answer(caption, reply_markup=await get_main_menu(user.role))
 
 
 async def show_procure_menu(cb: types.CallbackQuery, user: User):
@@ -375,7 +439,7 @@ def register_common_handlers(dp: Dispatcher):
     dp.callback_query.register(on_prihod,   lambda c: c.data == "prihod")
     dp.callback_query.register(on_korr_ost, lambda c: c.data == "korr_ost")
     dp.callback_query.register(on_postavki, lambda c: c.data == "postavki")
-    dp.callback_query.register(on_otchety,  lambda c: c.data == "otchety")
+    dp.callback_query.register(on_otchety,   lambda c: c.data == "otchety")
     dp.callback_query.register(back_to_main_menu, lambda c: c.data == "back_to_menu")
 
     # Подключить совместимость (последним из меню-роутеров)
