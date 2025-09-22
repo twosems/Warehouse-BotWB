@@ -1,10 +1,8 @@
 from __future__ import annotations
-
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Tuple, List
-
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -15,14 +13,12 @@ from aiogram.types import (
     InputMediaPhoto,
 )
 from sqlalchemy import select, or_, func
-
 from database.db import get_session
 from database.models import (
     CnPurchase, CnPurchaseItem, CnPurchaseStatus,
     MskInboundDoc, MskInboundItem,
     Product,
 )
-
 # ---- опциональная модель фото ----
 try:
     from database.models import CnPurchasePhoto  # id, cn_purchase_id, file_id, caption, uploaded_at, uploaded_by_user_id
@@ -91,10 +87,10 @@ class CnCreateState(StatesGroup):
 # -------- Keyboards ----------
 def cn_root_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Создать документ",      callback_data="cn:new")],
         [InlineKeyboardButton(text="📦 Доставляется в карго", callback_data="cn:list:cargo")],
         [InlineKeyboardButton(text="🚚 Доставляется в РФ",    callback_data="cn:list:ru")],
         [InlineKeyboardButton(text="🗄️ Архив",                callback_data="cn:list:archive")],
-        [InlineKeyboardButton(text="➕ Создать документ",      callback_data="cn:new")],
         [InlineKeyboardButton(text="⬅️ Назад",                 callback_data="back_to_menu")],
     ])
 
