@@ -1,8 +1,10 @@
+# handlers/cn_purchase.py
 from __future__ import annotations
 import re
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from typing import Optional, Tuple, List
+
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -13,12 +15,14 @@ from aiogram.types import (
     InputMediaPhoto,
 )
 from sqlalchemy import select, or_, func
+
 from database.db import get_session
 from database.models import (
     CnPurchase, CnPurchaseItem, CnPurchaseStatus,
     MskInboundDoc, MskInboundItem,
     Product,
 )
+
 # ---- опциональная модель фото ----
 try:
     from database.models import CnPurchasePhoto  # id, cn_purchase_id, file_id, caption, uploaded_at, uploaded_by_user_id
@@ -411,7 +415,8 @@ async def render_doc(msg: Message, doc_id: int):
         for it in items:
             p = pmap.get(it.product_id)
             title = f"{p.name} · {p.article}" if p else f"id={it.product_id}"
-            price = f"{(it.unit_cost_rub or Decimal('0')):.2f}"
+            from decimal import Decimal as _D
+            price = f"{(it.unit_cost_rub or _D('0')):.2f}"
             lines.append(f"• {title} — {it.qty} шт. × {price} ₽")
 
     # Полная хронология (1–6)
@@ -513,11 +518,12 @@ async def cn_set_status(cb: CallbackQuery):
 
         msk = (await s.execute(select(MskInboundDoc).where(MskInboundDoc.cn_purchase_id == doc.id))).scalar_one_or_none()
         if msk is None:
+            # Кладём DOCNAME в комментарий MSK-дока — дальше его можно использовать в визуализации
             msk = MskInboundDoc(
                 cn_purchase_id=doc.id,
                 created_at=datetime.utcnow(),
                 created_by_user_id=None,
-                comment=f"Из CN #{doc.code}",
+                comment=f"[DOCNAME: {doc.code}] Из CN #{doc.code}",
             )
             s.add(msk)
             await s.flush()

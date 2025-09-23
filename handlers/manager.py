@@ -1,192 +1,303 @@
 # handlers/manager.py
 from __future__ import annotations
 
+from typing import List, Tuple
+
 from aiogram import Router, F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from sqlalchemy import select, func
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select, func, desc
 
-from database.db import get_session
+from database.db import get_session, available_packed
 from database.models import (
-    User,
-    Supply, SupplyItem, Product, Warehouse, StockMovement,
-    ProductStage, MovementType,
+    User, UserRole,
+    Supply, SupplyItem, Warehouse, Product,
+    StockMovement, MovementType, ProductStage,
 )
+from handlers.common import send_content
 
 router = Router()
 PAGE = 10
 
+# ---------------------------
+# UI helpers
+# ---------------------------
 
-def kb_pick_list(items, page: int = 0) -> InlineKeyboardMarkup:
-    """
-    items: list of tuples (supply_id, warehouse_name, items_count)
-    """
+def _kb_manager_root() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 К сборке",     callback_data="mgr:list:queued")],
+        [InlineKeyboardButton(text="🛠 В работе",     callback_data="mgr:list:assembling")],
+        [InlineKeyboardButton(text="✅ Собранные",    callback_data="mgr:list:assembled")],
+        [InlineKeyboardButton(text="🚚 В пути",       callback_data="mgr:list:in_transit")],
+        [InlineKeyboardButton(text="⬅️ Назад",        callback_data="back_to_menu")],
+    ])
+
+_TITLES = {
+    "queued": "📥 К сборке",
+    "assembling": "🛠 В работе",
+    "assembled": "✅ Собранные",
+    "in_transit": "🚚 Доставляется",
+    "archived_delivered": "🗄 Доставлена (архив)",
+    "archived_returned": "🗄 Возврат (архив)",
+    "cancelled": "❌ Отменена",
+}
+
+def _kb_list(items: List[Tuple[int, str, int]], page: int, status: str) -> InlineKeyboardMarkup:
     start = page * PAGE
-    chunk = items[start:start + PAGE]
+    chunk = items[start:start+PAGE]
+    rows: List[List[InlineKeyboardButton]] = []
 
-    rows = [[InlineKeyboardButton(
-        text=f"#{sid} | {wh} | позиций {cnt}",
-        callback_data=f"pick:view:{sid}"
-    )] for sid, wh, cnt in chunk]
+    for sid, wh_name, cnt in chunk:
+        rows.append([InlineKeyboardButton(
+            text=f"SUP-{sid} • {wh_name} • позиций {cnt}",
+            callback_data=f"mgr:open:{sid}"
+        )])
 
     nav = []
     if start > 0:
-        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"pick:list:{page-1}"))
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"mgr:list:{status}:{page-1}"))
     if start + PAGE < len(items):
-        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"pick:list:{page+1}"))
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"mgr:list:{status}:{page+1}"))
     if nav:
         rows.append(nav)
 
-    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="supplies")])
+    rows.append([InlineKeyboardButton(text="🏠 Меню менеджера", callback_data="manager")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def kb_pick_card(sid: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Собрано", callback_data=f"pick:done:{sid}")],
-        [InlineKeyboardButton(text="⬅️ К списку", callback_data="pick:list:0")],
-    ])
+def _kb_card(s: Supply) -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+
+    # Доступные действия зависят от статуса (см. ТЗ §6.5)
+    if s.status == "in_transit":
+        rows.append([InlineKeyboardButton(text="✅ Доставлено",          callback_data=f"mgr:delivered:{s.id}")])
+        rows.append([InlineKeyboardButton(text="↩️ Возврат",             callback_data=f"mgr:return:{s.id}")])
+        rows.append([InlineKeyboardButton(text="♻️ Расформировать",      callback_data=f"mgr:unpost:{s.id}")])
+
+    # Общая навигация
+    rows.append([InlineKeyboardButton(text="⬅️ К спискам", callback_data="manager")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-async def _packed(session: AsyncSession, wh: int, pid: int) -> int:
-    val = (await session.execute(
-        select(func.coalesce(func.sum(StockMovement.qty), 0))
-        .where(StockMovement.warehouse_id == wh)
-        .where(StockMovement.product_id == pid)
-        .where(StockMovement.stage == ProductStage.packed)
-    )).scalar()
-    return int(val or 0)
+# ---------------------------
+# Root
+# ---------------------------
+
+@router.callback_query(F.data == "manager")
+async def manager_root(cb: types.CallbackQuery, user: User):
+    if user.role not in (UserRole.manager, UserRole.admin):
+        await cb.answer("Нет прав", show_alert=True)
+        return
+    await send_content(cb, "Управление поставками:", reply_markup=_kb_manager_root())
 
 
-async def _raw(session: AsyncSession, wh: int, pid: int) -> int:
-    val = (await session.execute(
-        select(func.coalesce(func.sum(StockMovement.qty), 0))
-        .where(StockMovement.warehouse_id == wh)
-        .where(StockMovement.product_id == pid)
-        .where(StockMovement.stage == ProductStage.raw)
-    )).scalar()
-    return int(val or 0)
+# ---------------------------
+# Списки по статусам (с пагинацией)
+# ---------------------------
 
+@router.callback_query(F.data.startswith("mgr:list:"))
+async def mgr_list(cb: types.CallbackQuery, user: User):
+    if user.role not in (UserRole.manager, UserRole.admin):
+        await cb.answer("Нет прав", show_alert=True)
+        return
 
-@router.callback_query(F.data == "picking")
-@router.callback_query(F.data.startswith("pick:list:"))
-async def pick_list(call: types.CallbackQuery, user: User):
-    """
-    Список поставок со статусом on_picking (постранично)
-    """
-    page = int(call.data.split(":")[-1]) if call.data.startswith("pick:list:") else 0
+    parts = cb.data.split(":")
+    # варианты: "mgr:list:queued" или "mgr:list:queued:2"
+    status = parts[2]
+    page = int(parts[3]) if len(parts) > 3 else 0
+
     async with get_session() as s:
         rows = (await s.execute(
             select(
                 Supply.id,
-                Warehouse.name,                         # показываем имя склада
+                Warehouse.name,
                 func.count(SupplyItem.id)
             )
             .join(Warehouse, Warehouse.id == Supply.warehouse_id)
-            .join(SupplyItem, SupplyItem.supply_id == Supply.id, isouter=True)
-            .where(Supply.status == "on_picking")
+            .outerjoin(SupplyItem, SupplyItem.supply_id == Supply.id)
+            .where(Supply.status == status)           # ВАЖНО: VARCHAR сравниваем со строкой
             .group_by(Supply.id, Warehouse.name)
             .order_by(Supply.id.desc())
         )).all()
 
-    # items = [(sid, wh_name, cnt), ...]
-    items = [(r[0], r[1], int(r[2])) for r in rows]
-    await call.message.edit_text("🧰 Задания на сборку:", reply_markup=kb_pick_list(items, page))
+    items: List[Tuple[int, str, int]] = [(r[0], r[1], int(r[2])) for r in rows]
+    if not items:
+        await send_content(cb, f"{_TITLES.get(status, status)}\n\nСписок пуст.", reply_markup=_kb_manager_root())
+        return
+
+    await send_content(
+        cb,
+        f"{_TITLES.get(status, status)} — выберите поставку:",
+        reply_markup=_kb_list(items, page, status)
+    )
 
 
-@router.callback_query(F.data.startswith("pick:view:"))
-async def pick_view(call: types.CallbackQuery, user: User):
-    """
-    Карточка конкретной поставки: показываем потребности и текущие остатки RAW/PACKED
-    """
-    sid = int(call.data.split(":")[-1])
+# ---------------------------
+# Карточка поставки (просмотр)
+# ---------------------------
+
+@router.callback_query(F.data.startswith("mgr:open:"))
+async def mgr_open(cb: types.CallbackQuery, user: User):
+    if user.role not in (UserRole.manager, UserRole.admin):
+        await cb.answer("Нет прав", show_alert=True)
+        return
+
+    sid = int(cb.data.split(":")[-1])
     async with get_session() as s:
         sup = (await s.execute(select(Supply).where(Supply.id == sid))).scalar_one_or_none()
         if not sup:
-            return await call.answer("Поставка не найдена", show_alert=True)
+            await cb.answer("Поставка не найдена", show_alert=True)
+            return
 
         wh_name = (await s.execute(select(Warehouse.name).where(Warehouse.id == sup.warehouse_id))).scalar_one()
-
-        # список позиций поставки
         items = (await s.execute(
             select(SupplyItem.product_id, SupplyItem.qty)
             .where(SupplyItem.supply_id == sid)
+            .order_by(SupplyItem.id)
         )).all()
 
-        lines = []
+        # Тело карточки + контроль доступности
+        lines: List[str] = []
+        total_qty = 0
+        total_def = 0
         for pid, need in items:
-            name = (await s.execute(select(Product.name).where(Product.id == pid))).scalar_one() or f"#{pid}"
-            packed = await _packed(s, sup.warehouse_id, pid)
-            raw = await _raw(s, sup.warehouse_id, pid)
-            lines.append(f"• {name}: нужно {need} | PACKED {packed} | RAW {raw}")
+            prod = (await s.execute(select(Product.name, Product.article).where(Product.id == pid))).first()
+            name, art = prod if prod else (f"#{pid}", None)
+            avail = await available_packed(s, sup.warehouse_id, pid)
+            deficit = max(0, need - max(avail, 0))
+            total_qty += int(need)
+            total_def += int(deficit)
+            lines.append(
+                f"• `{art or pid}` — *{name}*: план {need}, доступно PACKED {avail}, дефицит {deficit}"
+            )
 
-    text = f"📦 Поставка #{sid}\nСклад: {wh_name}\nСтатус: on_picking\n\n" + "\n".join(lines)
-    await call.message.edit_text(text, reply_markup=kb_pick_card(sid))
+    head = (
+        f"📦 Поставка *SUP-{sid}*\n"
+        f"🏬 Склад-источник: *{wh_name}*\n"
+        f"🧭 Статус: *{sup.status}*\n"
+        f"—\n"
+    )
+    body = "\n".join(lines) if lines else "_Позиции отсутствуют._"
+    tail = f"\n\n📈 Итого: {len(items)} позиций, план {total_qty}, суммарный дефицит {total_def}"
+    await send_content(cb, head + body + tail, parse_mode="Markdown", reply_markup=_kb_card(sup))
 
 
-@router.callback_query(F.data.startswith("pick:done:"))
-async def pick_done(call: types.CallbackQuery, user: User):
-    """
-    Авто-доупаковка дефицитов (если хватает RAW) и перевод поставки в status='picked'
-    Все движения пишем с user_id = user.id (а не tg_id).
-    """
-    sid = int(call.data.split(":")[-1])
+# ---------------------------
+# Действия по in_transit (менеджер)
+# ---------------------------
+
+async def _next_doc_id() -> int:
+    async with get_session() as s:
+        max_doc = (await s.execute(select(func.max(StockMovement.doc_id)))).scalar()
+        return int((max_doc or 0) + 1)
+
+@router.callback_query(F.data.startswith("mgr:delivered:"))
+async def mgr_delivered(cb: types.CallbackQuery, user: User):
+    if user.role not in (UserRole.manager, UserRole.admin):
+        await cb.answer("Нет прав", show_alert=True)
+        return
+
+    sid = int(cb.data.split(":")[-1])
     async with get_session() as s:
         sup = (await s.execute(select(Supply).where(Supply.id == sid))).scalar_one_or_none()
         if not sup:
-            return await call.answer("Поставка не найдена", show_alert=True)
+            return await cb.answer("Поставка не найдена", show_alert=True)
+        if sup.status != "in_transit":
+            return await cb.answer("Действие доступно только из статуса in_transit", show_alert=True)
+
+        sup.status = "archived_delivered"
+        await s.commit()
+
+    await cb.answer("Отмечено как доставлено.")
+    await mgr_open(cb, user)  # перерисовать карточку
+
+
+@router.callback_query(F.data.startswith("mgr:return:"))
+async def mgr_return(cb: types.CallbackQuery, user: User):
+    """
+    Возврат: приход PACKED по всем позициям поставки и статус -> archived_returned.
+    """
+    if user.role not in (UserRole.manager, UserRole.admin):
+        await cb.answer("Нет прав", show_alert=True)
+        return
+
+    sid = int(cb.data.split(":")[-1])
+    async with get_session() as s:
+        sup = (await s.execute(select(Supply).where(Supply.id == sid))).scalar_one_or_none()
+        if not sup:
+            return await cb.answer("Поставка не найдена", show_alert=True)
+        if sup.status != "in_transit":
+            return await cb.answer("Действие доступно только из статуса in_transit", show_alert=True)
 
         rows = (await s.execute(
             select(SupplyItem.product_id, SupplyItem.qty)
             .where(SupplyItem.supply_id == sid)
         )).all()
 
-        # проверим дефициты
-        shortages = []
-        for pid, need in rows:
-            packed = await _packed(s, sup.warehouse_id, pid)
-            deficit = max(0, need - packed)
-            if deficit:
-                raw = await _raw(s, sup.warehouse_id, pid)
-                if raw < deficit:
-                    shortages.append((pid, need, packed, raw, deficit))
+        doc_id = await _next_doc_id()
+        for pid, qty in rows:
+            s.add(StockMovement(
+                warehouse_id=sup.warehouse_id,
+                product_id=pid,
+                qty=qty,
+                type=MovementType.postavka,            # тип «поставка» используем для связанных движений
+                stage=ProductStage.packed,
+                user_id=user.id,
+                doc_id=doc_id,
+                comment=f"[SUP-RET {sid}] Возврат из МП",
+            ))
 
-        if shortages:
-            # покажем первые 3 строки, чтобы не улететь лимит алерта
-            lines = [
-                f"⛔ Недостаточно сырья: товар #{pid} | нужно {need} | PACKED {packed} | RAW {raw} | дефицит {deficit}"
-                for pid, need, packed, raw, deficit in shortages
-            ]
-            msg = "\n".join(lines[:3]) + ("..." if len(lines) > 3 else "")
-            return await call.answer(msg, show_alert=True)
-
-        # доупаковка дефицитов (raw- / packed+)
-        for pid, need in rows:
-            packed = await _packed(s, sup.warehouse_id, pid)
-            deficit = max(0, need - packed)
-            if deficit:
-                # raw -deficit
-                s.add(StockMovement(
-                    warehouse_id=sup.warehouse_id,
-                    product_id=pid,
-                    qty=-deficit,
-                    type=MovementType.upakovka,
-                    stage=ProductStage.raw,
-                    user_id=user.id,                        # <-- ВАЖНО: id из таблицы users
-                    comment=f"auto pack for supply#{sid}",
-                ))
-                # packed +deficit
-                s.add(StockMovement(
-                    warehouse_id=sup.warehouse_id,
-                    product_id=pid,
-                    qty=deficit,
-                    type=MovementType.upakovka,
-                    stage=ProductStage.packed,
-                    user_id=user.id,                        # <-- ВАЖНО: id из таблицы users
-                    comment=f"auto pack for supply#{sid}",
-                ))
-
-        sup.status = "picked"
+        sup.status = "archived_returned"
         await s.commit()
 
-    await call.message.edit_text(f"✅ Поставка #{sid} отмечена как «Собрано».")
+    await cb.answer("Возврат оформлен.")
+    await mgr_open(cb, user)
+
+
+@router.callback_query(F.data.startswith("mgr:unpost:"))
+async def mgr_unpost(cb: types.CallbackQuery, user: User):
+    """
+    Расформировать: приход PACKED (возврат на склад) и статус -> assembled.
+    """
+    if user.role not in (UserRole.manager, UserRole.admin):
+        await cb.answer("Нет прав", show_alert=True)
+        return
+
+    sid = int(cb.data.split(":")[-1])
+    async with get_session() as s:
+        sup = (await s.execute(select(Supply).where(Supply.id == sid))).scalar_one_or_none()
+        if not sup:
+            return await cb.answer("Поставка не найдена", show_alert=True)
+        if sup.status != "in_transit":
+            return await cb.answer("Действие доступно только из статуса in_transit", show_alert=True)
+
+        rows = (await s.execute(
+            select(SupplyItem.product_id, SupplyItem.qty)
+            .where(SupplyItem.supply_id == sid)
+        )).all()
+
+        doc_id = await _next_doc_id()
+        for pid, qty in rows:
+            s.add(StockMovement(
+                warehouse_id=sup.warehouse_id,
+                product_id=pid,
+                qty=qty,
+                type=MovementType.postavka,
+                stage=ProductStage.packed,
+                user_id=user.id,
+                doc_id=doc_id,
+                comment=f"[SUP-UNPOST {sid}] Расформирование поставки",
+            ))
+
+        sup.status = "assembled"   # вернули в собранные; короба открываются — реализуется в карточке/коробах
+        await s.commit()
+
+    await cb.answer("Поставка расформирована.")
+    await mgr_open(cb, user)
+
+
+# ---------------------------
+# Регистрация
+# ---------------------------
+
+def register_manager_handlers(dp):
+    dp.include_router(router)

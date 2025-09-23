@@ -26,3 +26,4 @@ credentials-sa.json
 *.sql
 *.sql.gz
 *.backup
+.env

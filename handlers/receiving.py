@@ -1,4 +1,9 @@
 # handlers/receiving.py
+from __future__ import annotations
+
+import re
+from typing import Optional
+
 from aiogram import Dispatcher, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
@@ -23,12 +28,33 @@ class IncomingState(StatesGroup):
     entering_comment = State()
     confirming = State()
 
+
 class ReceivingViewState(StatesGroup):
     viewing_docs = State()
 
 
 PAGE_SIZE_PRODUCTS = 10
 PAGE_SIZE_DOCS = 10
+
+# ===== Имя документа из комментария =====
+_DOCNAME_RE = re.compile(r"\[(?:DOCNAME|NAME)\s*:\s*([^\]]+)\]", re.IGNORECASE)
+_CN_CODE_RE = re.compile(r"(CN-\d{8}-\d{6})", re.IGNORECASE)  # fallback: распознать CN-код
+
+def _doc_label(doc_id: int, comment: Optional[str]) -> str:
+    """
+    Возвращает «человеческое» имя документа для заголовка/списка.
+    1) [DOCNAME: ...] из комментария;
+    2) если нет — пытаемся найти CN-код в комментарии;
+    3) иначе — «№<doc_id>».
+    """
+    if comment:
+        m = _DOCNAME_RE.search(comment)
+        if m:
+            return m.group(1).strip()
+        m2 = _CN_CODE_RE.search(comment)
+        if m2:
+            return m2.group(1).upper()
+    return f"№{doc_id}"
 
 
 def kb_receiving_root():
@@ -58,7 +84,11 @@ async def view_docs(cb: types.CallbackQuery, user: User, state: FSMContext, page
         total = await session.scalar(total_stmt)
 
         res = await session.execute(
-            select(StockMovement.doc_id, func.min(StockMovement.date).label("date"))
+            select(
+                StockMovement.doc_id,
+                func.min(StockMovement.date).label("date"),
+                func.max(StockMovement.comment).label("comment"),  # берём любой комментарий из группы
+            )
             .where(StockMovement.type == MovementType.prihod)
             .group_by(StockMovement.doc_id)
             .order_by(desc("date"))
@@ -81,8 +111,9 @@ async def view_docs(cb: types.CallbackQuery, user: User, state: FSMContext, page
     for row in docs:
         doc_id = row.doc_id
         date_str = row.date.strftime("%Y-%m-%d %H:%M")
+        human = _doc_label(doc_id, row.comment)
         rows.append([types.InlineKeyboardButton(
-            text=f"Документ №{doc_id} от {date_str}",
+            text=f"Документ {human} от {date_str}",
             callback_data=f"view_doc:{doc_id}"
         )])
 
@@ -140,7 +171,8 @@ async def view_doc(cb: types.CallbackQuery, user: User, state: FSMContext):
         return
 
     first_mv: StockMovement = movements[0][0]
-    header = f"📑 <b>Документ №{h(str(doc_id))} от {h(first_mv.date.strftime('%Y-%m-%d %H:%M:%S'))}</b>\n\n"
+    human = _doc_label(doc_id, first_mv.comment)
+    header = f"📑 <b>Документ {h(human)} от {h(first_mv.date.strftime('%Y-%m-%d %H:%M:%S'))}</b>\n\n"
 
     parts = [header]
     for mv, wh, prod, usr in movements:
@@ -416,7 +448,7 @@ async def confirm(cb: types.CallbackQuery, user: User, state: FSMContext):
     await state.clear()
     done = (
         f"✅ <b>Поступление записано.</b>\n\n"
-        f"📑 Документ № <b>{h(str(sm.doc_id))}</b>\n"
+        f"📑 Документ <b>{h(_doc_label(sm.doc_id, sm.comment))}</b>\n"
         f"📅 Дата: <b>{h(sm.date.strftime('%Y-%m-%d %H:%M:%S'))}</b>\n"
         f"🏬 Склад: <b>{h(str(data['warehouse_name']))}</b>\n"
         f"📦 Товар: <b>{h(str(data['product_name']))}</b> (арт. <code>{h(str(data['product_article']))}</code>)\n"

@@ -42,8 +42,8 @@ from utils.backup import run_backup, build_restore_cmd
 router = Router()
 
 # --------- Константы путей и сервиса ---------
-GOOGLE_TOKEN_PATH = "/opt/malinabotwh/app/token.json"
-GOOGLE_CLIENT_PATH = "/opt/malinabotwh/app/client_secret.json"
+GOOGLE_TOKEN_PATH = os.environ.get("GOOGLE_OAUTH_TOKEN_PATH", "/etc/botwb/google/token.json")
+GOOGLE_CLIENT_PATH = os.environ.get("GOOGLE_OAUTH_CLIENT_PATH", "/etc/botwb/google/client_secret_tv.json")
 SERVICE_NAME = "warehouse-botwb.service"
 
 # --------- OAuth Device Flow эндпоинты/скоуп ---------

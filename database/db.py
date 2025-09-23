@@ -12,7 +12,7 @@ import enum
 from datetime import datetime, date, time
 from decimal import Decimal
 
-from sqlalchemy import select, event, text
+from sqlalchemy import select, event, text, func
 from sqlalchemy.engine.url import make_url
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
 from sqlalchemy.inspection import inspect as sa_inspect
@@ -21,6 +21,12 @@ from sqlalchemy.orm import Session
 from config import DB_URL
 from database.models import Base, Warehouse, AuditLog, AuditAction
 from database.menu_visibility import ensure_menu_visibility_defaults
+
+# для хелпера available_packed
+from database.models import (
+    StockMovement, ProductStage,
+    Supply, SupplyItem,
+)
 
 
 # ---------------------------
@@ -182,6 +188,37 @@ async def ensure_core_data() -> None:
         if to_add:
             session.add_all(to_add)
             await session.commit()
+
+
+# ---------------------------
+# Stock helpers (важно: supplies.status — VARCHAR)
+# ---------------------------
+async def available_packed(session: AsyncSession, warehouse_id: int, product_id: int) -> int:
+    """
+    Доступный PACKED = фактический PACKED - сумма qty в активных поставках
+    (status in 'assembling'|'assembled'|'in_transit') по этому складу/товару.
+    """
+    fact = await session.scalar(
+        select(func.coalesce(func.sum(StockMovement.qty), 0))
+        .where(
+            StockMovement.warehouse_id == warehouse_id,
+            StockMovement.product_id == product_id,
+            StockMovement.stage == ProductStage.packed,
+            )
+    )
+
+    # колонка supplies.status у вас VARCHAR → сравниваем со строками
+    active_status = ("assembling", "assembled", "in_transit")
+    reserved = await session.scalar(
+        select(func.coalesce(func.sum(SupplyItem.qty), 0))
+        .join(Supply, Supply.id == SupplyItem.supply_id)
+        .where(
+            Supply.warehouse_id == warehouse_id,
+            Supply.status.in_(active_status),
+            SupplyItem.product_id == product_id,
+            )
+    )
+    return int((fact or 0) - (reserved or 0))
 
 
 # ---------------------------

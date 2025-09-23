@@ -1,18 +1,19 @@
+# handlers/msk_inbound.py
 from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Dict
 
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import CallbackQuery, Message, InlineKeyboardMarkup, InlineKeyboardButton
-from sqlalchemy import select, func
+from sqlalchemy import select
 
 from database.db import get_session
 from database.models import (
     MovementType, ProductStage,
-    CnPurchase,  # подтягиваем даты для таймлайна
+    CnPurchase,  # нужен для кода и таймлайна
     CnPurchaseStatus,
     MskInboundDoc, MskInboundItem, MskInboundStatus,
     Warehouse, Product, StockMovement, User,
@@ -42,6 +43,7 @@ async def safe_edit_reply_markup(msg: Message, markup: InlineKeyboardMarkup | No
 
 # ========= helpers =========
 _re_int = re.compile(r"(\d+)")
+_DOCNAME_RE = re.compile(r"\[(?:DOCNAME|NAME)\s*:\s*([^\]]+)\]", re.IGNORECASE)
 
 def last_int(data: str) -> Optional[int]:
     if not data:
@@ -61,6 +63,13 @@ def last_two_ints(data: str) -> Tuple[Optional[int], Optional[int]]:
 
 def fmt_dt(dt: datetime | None) -> str:
     return dt.strftime("%d.%m.%Y %H:%M") if dt else "—"
+
+def docname_from_text(text: Optional[str]) -> Optional[str]:
+    """Достаёт [DOCNAME: ...] из комментария, если есть."""
+    if not text:
+        return None
+    m = _DOCNAME_RE.search(text)
+    return m.group(1).strip() if m else None
 
 # ========= keyboards =========
 def msk_root_kb() -> InlineKeyboardMarkup:
@@ -117,6 +126,13 @@ async def msk_list(cb: CallbackQuery):
     async with get_session() as s:
         all_rows = (await s.execute(select(MskInboundDoc).order_by(MskInboundDoc.created_at.desc()))).scalars().all()
 
+        # подгружаем коды CN одним запросом
+        cn_ids = [r.cn_purchase_id for r in all_rows if r and r.cn_purchase_id]
+        cn_map: Dict[int, str] = {}
+        if cn_ids:
+            cn_rows = (await s.execute(select(CnPurchase.id, CnPurchase.code).where(CnPurchase.id.in_(cn_ids)))).all()
+            cn_map = {i: code for i, code in cn_rows}
+
     if mode == "in_ru":
         rows = [r for r in all_rows if r.status == MskInboundStatus.PENDING and not r.warehouse_id]
         title = "🚚 Доставка в РФ"
@@ -137,8 +153,10 @@ async def msk_list(cb: CallbackQuery):
 
     kb_rows: list[list[InlineKeyboardButton]] = []
     for r in rows:
+        # имя документа: DOCNAME из комментария MSK или код CN
+        human = docname_from_text(r.comment) or cn_map.get(r.cn_purchase_id, f"CN#{r.cn_purchase_id}")
         kb_rows.append([InlineKeyboardButton(
-            text=f"📦 MSK #{r.id} (из CN #{r.cn_purchase_id})",
+            text=f"📦 {human} · MSK #{r.id}",
             callback_data=f"msk:open:{r.id}"
         )])
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="msk:root")])
@@ -161,7 +179,7 @@ async def _fetch_msk_view(msk_id: int):
 
         wh_name = msk.warehouse.name if msk and msk.warehouse else None
 
-        # подтягиваем связанный CN для таймлайна
+        # связанный CN
         cn = await s.get(CnPurchase, msk.cn_purchase_id) if msk else None
 
     return msk, items, pmap, wh_name, cn
@@ -179,8 +197,11 @@ async def render_msk_doc(msg: Message, msk_id: int):
     else:
         status_text = "🗄️ Принято (архив)"
 
+    # читаем «человеческое имя»: DOCNAME или код CN
+    docname = docname_from_text(msk.comment) or (getattr(cn, "code", None) or f"CN#{msk.cn_purchase_id}")
+
     lines = [
-        f"📦 MSK-док #{msk.id} (из CN #{msk.cn_purchase_id})",
+        f"📦 {docname} · MSK-док #{msk.id}",
         f"Статус: {status_text}",
         f"Склад назначения: {wh_name or '—'}",
         f"💬 Комментарий: {getattr(msk, 'comment', None) or '—'}",
@@ -297,6 +318,9 @@ async def msk_deliver(cb: CallbackQuery):
             await cb.answer("Не выбран склад назначения.", show_alert=True)
             return
 
+        cn = await s.get(CnPurchase, msk.cn_purchase_id) if msk.cn_purchase_id else None
+        cn_code = getattr(cn, "code", None)
+
         db_user = (await s.execute(
             select(User).where(User.telegram_id == cb.from_user.id)
         )).scalar_one_or_none()
@@ -310,15 +334,22 @@ async def msk_deliver(cb: CallbackQuery):
             await cb.answer("В документе нет позиций.", show_alert=True)
             return
 
-        max_doc = (await s.execute(
-            select(func.max(StockMovement.doc_id)).where(StockMovement.type == MovementType.prihod)
-        )).scalar()
-        next_doc = (max_doc or 0) + 1
+        # имя документа: сначала DOCNAME из комментария MSK, иначе CN-код, иначе MSK #
+        docname = docname_from_text(msk.comment) or cn_code or f"MSK#{msk.id}"
 
+        # единый комментарий с маркером DOCNAME
         base_comment = "Оприходовано со склада МСК"
-        comment_full = f"{base_comment}: MSK #{msk.id} (из CN #{msk.cn_purchase_id})".strip()
+        comment_full = f"[DOCNAME: {docname}] {base_comment}: MSK #{msk.id}" + (f" (из {cn_code})" if cn_code else "")
 
         now = datetime.utcnow()
+        # под одним doc_id — групповое поступление
+        # определение doc_id перенесено в СУБД (автоинкремент StockMovement.doc_id отсутствует),
+        # поэтому используем «следующий»: max(doc_id)+1 среди прихода.
+        max_doc = (await s.execute(
+            select(StockMovement.doc_id).where(StockMovement.type == MovementType.prihod).order_by(StockMovement.doc_id.desc())
+        )).scalars().first()
+        next_doc = (max_doc or 0) + 1
+
         for it in items:
             s.add(StockMovement(
                 type=MovementType.prihod,

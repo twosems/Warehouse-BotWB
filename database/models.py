@@ -1,4 +1,3 @@
-# database/models.py
 from __future__ import annotations
 
 import enum
@@ -29,7 +28,7 @@ class MovementType(enum.Enum):
     prihod = "prihod"
     korrekt = "korrekt"
     postavka = "postavka"
-    upakovka = "upakovka"  # на будущее/для упаковки
+    upakovka = "upakovka"  # для упаковки
 
 
 class AuditAction(enum.Enum):
@@ -39,22 +38,18 @@ class AuditAction(enum.Enum):
 
 
 class MenuItem(enum.Enum):
-    """Пункты главного меню, управляемые по ролям."""
     stocks = "stocks"
     receiving = "receiving"
     supplies = "supplies"
     packing = "packing"
-    picking = "picking"            # «Сборка»
+    picking = "picking"
     reports = "reports"
-    # ▼ Новые разделы
-    purchase_cn = "purchase_cn"    # «Закупка CN»
-    msk_warehouse = "msk_warehouse"  # «Склад MSK»
-    # —
+    purchase_cn = "purchase_cn"
+    msk_warehouse = "msk_warehouse"
     admin = "admin"
 
 
 class ProductStage(enum.Enum):
-    """Стадия товара на складе."""
     raw = "raw"
     packed = "packed"
 
@@ -62,15 +57,15 @@ class ProductStage(enum.Enum):
 # ——— Новые enum'ы для закупки CN и входящих МСК ———
 
 class CnPurchaseStatus(enum.Enum):
-    PURCHASED = "1_purchased"                # 1 — закуплено
-    SENT_TO_CARGO = "2_sent_to_cargo"        # 2 — отправлено на склад карго
-    SENT_TO_MSK = "3_sent_to_msk"            # 3 — отправлено на склад МСК
-    DELIVERED_TO_MSK = "4_delivered_to_msk"  # 4 — доставлен склад МСК (архив)
+    PURCHASED = "1_purchased"
+    SENT_TO_CARGO = "2_sent_to_cargo"
+    SENT_TO_MSK = "3_sent_to_msk"
+    DELIVERED_TO_MSK = "4_delivered_to_msk"
 
 
 class MskInboundStatus(enum.Enum):
-    PENDING = "pending"     # создан автоматически из CN (на статусе 3)
-    RECEIVED = "received"   # принято на склад (архив)
+    PENDING = "pending"
+    RECEIVED = "received"
 
 
 # ===== Core tables =====
@@ -113,12 +108,24 @@ class StockMovement(Base):
     doc_id = Column(Integer)
     user_id = Column(Integer, ForeignKey("users.id"))
     comment = Column(String)
-    # Стадия товара (по умолчанию 'packed' для совместимости с историей)
     stage = Column(
         Enum(ProductStage, name="product_stage_enum"),
         nullable=False,
         default=ProductStage.packed
     )
+
+
+# ===== SUPPLIES (ТЗ v1.0) =====
+
+class SupplyStatus(enum.Enum):
+    draft = "draft"
+    queued = "queued"
+    assembling = "assembling"
+    assembled = "assembled"
+    in_transit = "in_transit"
+    archived_delivered = "archived_delivered"
+    archived_returned = "archived_returned"
+    cancelled = "cancelled"
 
 
 class Supply(Base):
@@ -127,9 +134,34 @@ class Supply(Base):
     warehouse_id = Column(Integer, ForeignKey("warehouses.id"))
     created_by = Column(Integer, ForeignKey("users.id"))
     created_at = Column(TIMESTAMP, server_default=func.current_timestamp())
-    status = Column(String(20), default="formed")  # TODO: перевести на Enum
-    manager_notified_at = Column(TIMESTAMP)
-    manager_confirmed_at = Column(TIMESTAMP)
+
+    status = Column(SAEnum(SupplyStatus, name="supply_status", create_type=False),
+                    nullable=False, default=SupplyStatus.draft)
+
+    mp = Column(String(16))                # 'wb' | 'ozon'
+    mp_warehouse = Column(String(128))     # код/имя МП-склада
+    assigned_picker_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    comment = Column(String)
+
+    queued_at = Column(DateTime)
+    assembled_at = Column(DateTime)
+    posted_at = Column(DateTime)
+    delivered_at = Column(DateTime)
+    returned_at = Column(DateTime)
+    unposted_at = Column(DateTime)
+
+    items: Mapped[List["SupplyItem"]] = relationship(
+        back_populates="supply", cascade="all, delete-orphan"
+    )
+
+
+class SupplyBox(Base):
+    __tablename__ = "supply_boxes"
+    id = Column(Integer, primary_key=True)
+    supply_id = Column(Integer, ForeignKey("supplies.id", ondelete="CASCADE"), index=True, nullable=False)
+    box_number = Column(Integer, nullable=False)
+    sealed = Column(Boolean, nullable=False, default=False)
+    # items связь не обязательна в ORM, используем из SupplyItem.box_id
 
 
 class SupplyItem(Base):
@@ -138,14 +170,24 @@ class SupplyItem(Base):
     supply_id = Column(Integer, ForeignKey("supplies.id"))
     product_id = Column(Integer, ForeignKey("products.id"))
     qty = Column(Integer, nullable=False)
+    box_id = Column(Integer, ForeignKey("supply_boxes.id", ondelete="CASCADE"), nullable=True)
+
+    supply: Mapped["Supply"] = relationship(back_populates="items")
+
+
+class SupplyFile(Base):
+    __tablename__ = "supply_files"
+    id = Column(Integer, primary_key=True)
+    supply_id = Column(Integer, ForeignKey("supplies.id", ondelete="CASCADE"), index=True, nullable=False)
+    file_id = Column(String(256), nullable=False)  # Telegram file_id
+    filename = Column(String(255))
+    uploaded_by = Column(Integer, ForeignKey("users.id"))
+    uploaded_at = Column(DateTime, server_default=func.current_timestamp())
 
 
 # ===== Role-based menu visibility =====
 
 class RoleMenuVisibility(Base):
-    """
-    Видимость пунктов главного меню по ролям.
-    """
     __tablename__ = "role_menu_visibility"
     __table_args__ = (UniqueConstraint("role", "item", name="uq_role_menu_item"),)
 
@@ -162,10 +204,10 @@ class AuditLog(Base):
     id = Column(Integer, primary_key=True)
     created_at = Column(TIMESTAMP, server_default=func.current_timestamp(), nullable=False)
 
-    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)  # кто сделал действие (может быть None для system)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     action = Column(Enum(AuditAction, name="audit_action_enum"), nullable=False)
     table_name = Column(String(64), nullable=False)
-    record_pk = Column(String(128))  # PK в строковом виде (подходит и для составных PK)
+    record_pk = Column(String(128))
     old_data = Column(JSONB)
     new_data = Column(JSONB)
     diff = Column(JSONB)
@@ -190,13 +232,11 @@ class PackDoc(Base):
     # Новая колонка
     notes: Mapped[Optional[str]] = mapped_column(String(255))
 
-    # В БД уже существует ENUM packdocstatus ('draft','posted').
-    # Чтобы Alembic не пытался переименовывать тип, явно указываем имя и запрещаем создание типа.
     status: Mapped[PackDocStatus] = mapped_column(
         SAEnum(
             PackDocStatus,
             name="packdocstatus",
-            create_type=False,   # не создавать тип заново
+            create_type=False,
             native_enum=True
         ),
         default=PackDocStatus.draft,
@@ -230,12 +270,12 @@ class CnPurchase(Base):
     __tablename__ = "cn_purchases"
 
     id: Mapped[int] = mapped_column(primary_key=True)
-    code: Mapped[str] = mapped_column(String(40), unique=True, nullable=False)  # CN-YYYYMMDD-HHMMSS
+    code: Mapped[str] = mapped_column(String(40), unique=True, nullable=False)
     status: Mapped[CnPurchaseStatus] = mapped_column(
         Enum(
             CnPurchaseStatus,
             name="cn_purchase_status",
-            values_callable=lambda enum_cls: [e.value for e in enum_cls],  # храним .value
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
         ),
         default=CnPurchaseStatus.PURCHASED,
         nullable=False,
@@ -247,21 +287,18 @@ class CnPurchase(Base):
     updated_at: Mapped[Optional[datetime]] = mapped_column(default=None, onupdate=datetime.utcnow)
     updated_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))
 
-    # Хронология статусов
-    sent_to_cargo_at = Column(DateTime, nullable=True)   # при создании CN
-    sent_to_msk_at   = Column(DateTime, nullable=True)   # перевод в "Доставка склад МСК"
-    archived_at      = Column(DateTime, nullable=True)   # когда CN ушёл в архив
+    sent_to_cargo_at = Column(DateTime, nullable=True)
+    sent_to_msk_at   = Column(DateTime, nullable=True)
+    archived_at      = Column(DateTime, nullable=True)
 
     items: Mapped[List["CnPurchaseItem"]] = relationship(
         back_populates="purchase", cascade="all, delete-orphan"
     )
 
-    # ФОТО: связь 1:N с фото
     photos: Mapped[List["CnPurchasePhoto"]] = relationship(
         back_populates="purchase", cascade="all, delete-orphan", lazy="selectin"
     )
 
-    # связь 1:1 с входящим МСК документом
     msk_inbound: Mapped[Optional["MskInboundDoc"]] = relationship(
         back_populates="cn_purchase", uselist=False, cascade="all, delete-orphan"
     )
@@ -282,7 +319,6 @@ class CnPurchaseItem(Base):
     product: Mapped["Product"] = relationship()
 
 
-# --- Фото для закупки CN ---
 class CnPurchasePhoto(Base):
     __tablename__ = "cn_purchase_photos"
 
@@ -291,7 +327,7 @@ class CnPurchasePhoto(Base):
         ForeignKey("cn_purchases.id", ondelete="CASCADE"),
         index=True, nullable=False
     )
-    file_id: Mapped[str] = mapped_column(String(256), nullable=False)  # Telegram file_id
+    file_id: Mapped[str] = mapped_column(String(256), nullable=False)
     caption: Mapped[Optional[str]] = mapped_column(String(512))
     uploaded_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=datetime.utcnow)
     uploaded_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))
@@ -299,7 +335,7 @@ class CnPurchasePhoto(Base):
     purchase: Mapped["CnPurchase"] = relationship(back_populates="photos")
 
 
-# ===== Входящие МСК (создаются на статусе CN=3) =====
+# ===== Входящие МСК =====
 
 class MskInboundDoc(Base):
     __tablename__ = "msk_inbound_docs"
@@ -313,7 +349,7 @@ class MskInboundDoc(Base):
         Enum(
             MskInboundStatus,
             name="msk_inbound_status",
-            values_callable=lambda enum_cls: [e.value for e in enum_cls],  # храним .value
+            values_callable=lambda enum_cls: [e.value for e in enum_cls],
         ),
         default=MskInboundStatus.PENDING,
         nullable=False,
@@ -322,12 +358,10 @@ class MskInboundDoc(Base):
     created_at: Mapped[datetime] = mapped_column(default=datetime.utcnow, nullable=False)
     created_by_user_id: Mapped[Optional[int]] = mapped_column(ForeignKey("users.id"))
 
-    # ВАЖНО: в БД колонка называется target_warehouse_id — маппим на неё.
     warehouse_id: Mapped[Optional[int]] = mapped_column(
         "target_warehouse_id", ForeignKey("warehouses.id"), nullable=True
     )
 
-    # НОВОЕ: когда выбран склад назначения (для таймлайна MSK)
     to_our_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
 
     received_at: Mapped[Optional[datetime]]
@@ -339,7 +373,6 @@ class MskInboundDoc(Base):
         back_populates="doc", cascade="all, delete-orphan"
     )
 
-    # relationship с явным указанием внешнего ключа
     warehouse: Mapped[Optional["Warehouse"]] = relationship(
         "Warehouse", foreign_keys=[warehouse_id], lazy="joined"
     )
@@ -376,6 +409,6 @@ class BackupSettings(Base):
     time_minute = Column(Integer, nullable=False, default=15)
     retention_days = Column(Integer, nullable=False, default=30)
     gdrive_folder_id = Column(String(128))
-    gdrive_sa_json = Column(JSONB)          # сам JSON сервис-аккаунта
+    gdrive_sa_json = Column(JSONB)
     last_run_at = Column(TIMESTAMP)
     last_status = Column(String(255))

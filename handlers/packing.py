@@ -79,7 +79,14 @@ def _cart_summary(cart: Dict[int, int]) -> Tuple[int, int]:
     return len(cart), sum(cart.values())
 
 
-# Универсальная inline‑кнопка «Назад»
+def _pack_docname(number: str) -> str:
+    """
+    Единое «человеческое» имя упаковочного документа, попадает в комментарии движений.
+    """
+    return f"PACK {number}"
+
+
+# Универсальная inline-кнопка «Назад»
 def back_inline_kb(target: str = "back_to_packing") -> types.InlineKeyboardMarkup:
     return types.InlineKeyboardMarkup(
         inline_keyboard=[[types.InlineKeyboardButton(text="⬅️ Назад", callback_data=target)]]
@@ -419,18 +426,22 @@ async def pack_post(cb: types.CallbackQuery, user: User, state: FSMContext):
         session.add(doc)
         await session.flush()  # получаем doc.id
 
+        docname = _pack_docname(number)
+
         # позиции документа + движения
         for pid, qty in cart.items():
             session.add(PackDocItem(doc_id=doc.id, product_id=pid, qty=qty))
             # raw -
             session.add(StockMovement(
                 type=MovementType.upakovka, stage=ProductStage.raw, qty=-qty,
-                product_id=pid, warehouse_id=wh_id, doc_id=doc.id
+                product_id=pid, warehouse_id=wh_id, doc_id=doc.id,
+                comment=f"[DOCNAME: {docname}] Упаковка: списание RAW по PACK №{number}",
             ))
             # packed +
             session.add(StockMovement(
                 type=MovementType.upakovka, stage=ProductStage.packed, qty=qty,
-                product_id=pid, warehouse_id=wh_id, doc_id=doc.id
+                product_id=pid, warehouse_id=wh_id, doc_id=doc.id,
+                comment=f"[DOCNAME: {docname}] Упаковка: оприходование PACKED по PACK №{number}",
             ))
 
         # помечаем документ как проведённый
