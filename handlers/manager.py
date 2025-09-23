@@ -5,13 +5,13 @@ from typing import List, Tuple
 
 from aiogram import Router, F, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from sqlalchemy import select, func, desc
+from sqlalchemy import select, func
 
 from database.db import get_session, available_packed
 from database.models import (
     User, UserRole,
     Supply, SupplyItem, Warehouse, Product,
-    StockMovement, MovementType, ProductStage,
+    StockMovement, MovementType, ProductStage, SupplyStatus,
 )
 from handlers.common import send_content
 
@@ -68,7 +68,7 @@ def _kb_card(s: Supply) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
 
     # Доступные действия зависят от статуса (см. ТЗ §6.5)
-    if s.status == "in_transit":
+    if s.status == SupplyStatus.in_transit:
         rows.append([InlineKeyboardButton(text="✅ Доставлено",          callback_data=f"mgr:delivered:{s.id}")])
         rows.append([InlineKeyboardButton(text="↩️ Возврат",             callback_data=f"mgr:return:{s.id}")])
         rows.append([InlineKeyboardButton(text="♻️ Расформировать",      callback_data=f"mgr:unpost:{s.id}")])
@@ -102,7 +102,7 @@ async def mgr_list(cb: types.CallbackQuery, user: User):
 
     parts = cb.data.split(":")
     # варианты: "mgr:list:queued" или "mgr:list:queued:2"
-    status = parts[2]
+    status = SupplyStatus(parts[2])  # строку → Enum
     page = int(parts[3]) if len(parts) > 3 else 0
 
     async with get_session() as s:
@@ -114,20 +114,24 @@ async def mgr_list(cb: types.CallbackQuery, user: User):
             )
             .join(Warehouse, Warehouse.id == Supply.warehouse_id)
             .outerjoin(SupplyItem, SupplyItem.supply_id == Supply.id)
-            .where(Supply.status == status)           # ВАЖНО: VARCHAR сравниваем со строкой
+            .where(Supply.status == status)  # сравнение Enum с Enum
             .group_by(Supply.id, Warehouse.name)
             .order_by(Supply.id.desc())
         )).all()
 
     items: List[Tuple[int, str, int]] = [(r[0], r[1], int(r[2])) for r in rows]
     if not items:
-        await send_content(cb, f"{_TITLES.get(status, status)}\n\nСписок пуст.", reply_markup=_kb_manager_root())
+        await send_content(
+            cb,
+            f"{_TITLES.get(status.value, status.value)}\n\nСписок пуст.",
+            reply_markup=_kb_manager_root()
+        )
         return
 
     await send_content(
         cb,
-        f"{_TITLES.get(status, status)} — выберите поставку:",
-        reply_markup=_kb_list(items, page, status)
+        f"{_TITLES.get(status.value, status.value)} — выберите поставку:",
+        reply_markup=_kb_list(items, page, status.value)  # для callback передаём строковое значение
     )
 
 
@@ -173,7 +177,7 @@ async def mgr_open(cb: types.CallbackQuery, user: User):
     head = (
         f"📦 Поставка *SUP-{sid}*\n"
         f"🏬 Склад-источник: *{wh_name}*\n"
-        f"🧭 Статус: *{sup.status}*\n"
+        f"🧭 Статус: *{sup.status.value}*\n"
         f"—\n"
     )
     body = "\n".join(lines) if lines else "_Позиции отсутствуют._"
@@ -201,10 +205,10 @@ async def mgr_delivered(cb: types.CallbackQuery, user: User):
         sup = (await s.execute(select(Supply).where(Supply.id == sid))).scalar_one_or_none()
         if not sup:
             return await cb.answer("Поставка не найдена", show_alert=True)
-        if sup.status != "in_transit":
+        if sup.status != SupplyStatus.in_transit:
             return await cb.answer("Действие доступно только из статуса in_transit", show_alert=True)
 
-        sup.status = "archived_delivered"
+        sup.status = SupplyStatus.archived_delivered
         await s.commit()
 
     await cb.answer("Отмечено как доставлено.")
@@ -225,7 +229,7 @@ async def mgr_return(cb: types.CallbackQuery, user: User):
         sup = (await s.execute(select(Supply).where(Supply.id == sid))).scalar_one_or_none()
         if not sup:
             return await cb.answer("Поставка не найдена", show_alert=True)
-        if sup.status != "in_transit":
+        if sup.status != SupplyStatus.in_transit:
             return await cb.answer("Действие доступно только из статуса in_transit", show_alert=True)
 
         rows = (await s.execute(
@@ -246,7 +250,7 @@ async def mgr_return(cb: types.CallbackQuery, user: User):
                 comment=f"[SUP-RET {sid}] Возврат из МП",
             ))
 
-        sup.status = "archived_returned"
+        sup.status = SupplyStatus.archived_returned
         await s.commit()
 
     await cb.answer("Возврат оформлен.")
@@ -267,7 +271,7 @@ async def mgr_unpost(cb: types.CallbackQuery, user: User):
         sup = (await s.execute(select(Supply).where(Supply.id == sid))).scalar_one_or_none()
         if not sup:
             return await cb.answer("Поставка не найдена", show_alert=True)
-        if sup.status != "in_transit":
+        if sup.status != SupplyStatus.in_transit:
             return await cb.answer("Действие доступно только из статуса in_transit", show_alert=True)
 
         rows = (await s.execute(
@@ -288,7 +292,7 @@ async def mgr_unpost(cb: types.CallbackQuery, user: User):
                 comment=f"[SUP-UNPOST {sid}] Расформирование поставки",
             ))
 
-        sup.status = "assembled"   # вернули в собранные; короба открываются — реализуется в карточке/коробах
+        sup.status = SupplyStatus.assembled   # вернули в собранные; короба открываются — реализуется в карточке/коробах
         await s.commit()
 
     await cb.answer("Поставка расформирована.")

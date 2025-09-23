@@ -135,8 +135,16 @@ class Supply(Base):
     created_by = Column(Integer, ForeignKey("users.id"))
     created_at = Column(TIMESTAMP, server_default=func.current_timestamp())
 
-    status = Column(SAEnum(SupplyStatus, name="supply_status", create_type=False),
-                    nullable=False, default=SupplyStatus.draft)
+    status = Column(
+        SAEnum(
+            SupplyStatus,
+            name="supply_status",
+            create_type=True,   # включаем автосоздание типа
+            native_enum=True
+        ),
+        nullable=False,
+        default=SupplyStatus.draft
+    )
 
     mp = Column(String(16))                # 'wb' | 'ozon'
     mp_warehouse = Column(String(128))     # код/имя МП-склада
@@ -235,8 +243,8 @@ class PackDoc(Base):
     status: Mapped[PackDocStatus] = mapped_column(
         SAEnum(
             PackDocStatus,
-            name="packdocstatus",
-            create_type=False,
+            name="pack_doc_status_enum",   # стабильное имя типа
+            create_type=True,              # ORM создаст тип, если его нет
             native_enum=True
         ),
         default=PackDocStatus.draft,
@@ -250,7 +258,6 @@ class PackDoc(Base):
         back_populates="doc",
         cascade="all, delete-orphan"
     )
-
 
 class PackDocItem(Base):
     __tablename__ = "pack_doc_items"

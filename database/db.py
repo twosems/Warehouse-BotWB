@@ -7,8 +7,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from typing import AsyncGenerator, Optional
-
 import enum
+import pathlib
 from datetime import datetime, date, time
 from decimal import Decimal
 
@@ -19,19 +19,16 @@ from sqlalchemy.inspection import inspect as sa_inspect
 from sqlalchemy.orm import Session
 
 from config import DB_URL
-from database.models import Base, Warehouse, AuditLog, AuditAction
-from database.menu_visibility import ensure_menu_visibility_defaults
-
+from database.models import Base, Warehouse, AuditLog, AuditAction, SupplyStatus
 # для хелпера available_packed
 from database.models import (
     StockMovement, ProductStage,
     Supply, SupplyItem,
 )
 
-
-# ---------------------------
-# Engine & session factory (устойчивый пул)
-# ---------------------------
+# ---------------------------------------------------------------------
+# Engine & Session
+# ---------------------------------------------------------------------
 engine = create_async_engine(
     DB_URL,
     echo=False,
@@ -67,6 +64,7 @@ async def ping_db() -> None:
     """
     async with SessionFactory() as s:
         await s.execute(text("SELECT 1"))
+
 
 async def ensure_database_exists() -> None:
     """
@@ -129,10 +127,70 @@ async def ensure_database_exists() -> None:
         await admin_engine.dispose(close=True)
 
 
+# ---------------------------------------------------------------------
+# Раннер SQL-патчей (минимальная замена Alembic)
+# ---------------------------------------------------------------------
+PATCHES_DIR = pathlib.Path(__file__).resolve().parents[1] / "sql" / "patches"
 
-# ---------------------------
+# --- замени вашу apply_sql_patches на эту ---
+async def apply_sql_patches():
+    """
+    Простой раннер SQL-патчей.
+    - Папка: sql/patches
+    - Имена файлов: 001_*.sql, 002_*.sql, ...
+    - Хранит версию в таблице schema_version (max(version))
+    - Игнорирует пустые/комментные патчи; поддерживает несколько выражений через ';'
+    """
+    PATCHES_DIR.mkdir(parents=True, exist_ok=True)
+    async with engine.begin() as conn:
+        # таблица версий
+        await conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS schema_version(
+                version INTEGER PRIMARY KEY
+            )
+        """))
+        current = await conn.execute(text("SELECT COALESCE(MAX(version), 0) FROM schema_version"))
+        (current_version,) = current.fetchone()
+
+        patches = sorted(PATCHES_DIR.glob("*.sql"))
+        for p in patches:
+            # ожидаем имена вида 001_*.sql
+            try:
+                v = int(p.stem.split("_", 1)[0])
+            except Exception:
+                continue
+            if v <= current_version:
+                continue
+
+            raw = p.read_text(encoding="utf-8")
+
+            # уберём пустые строки и комментарии '-- ...'
+            lines = []
+            for ln in raw.splitlines():
+                s = ln.strip()
+                if not s or s.startswith("--"):
+                    continue
+                lines.append(ln)
+            cleaned = "\n".join(lines).strip()
+
+            # если после чистки не осталось SQL — всё равно фиксируем версию
+            if cleaned:
+                # простое разбиение по ';' (для наших простых патчей ок)
+                for stmt in cleaned.split(";"):
+                    stmt = stmt.strip()
+                    if not stmt:
+                        continue
+                    await conn.execute(text(stmt))
+
+            # записываем применённую версию даже если патч пустой
+            await conn.execute(
+                text("INSERT INTO schema_version(version) VALUES (:v)"),
+                {"v": v}
+            )
+
+# ---------------------------------------------------------------------
 # Текущий пользователь для аудита (ставим из middleware/handler)
-# ---------------------------
+# ---------------------------------------------------------------------
 _current_audit_user_id: ContextVar[Optional[int]] = ContextVar("current_audit_user_id", default=None)
 
 
@@ -144,27 +202,29 @@ def set_audit_user(user_id: Optional[int]) -> None:
     _current_audit_user_id.set(user_id)
 
 
-# ---------------------------
+# ---------------------------------------------------------------------
 # Public API
-# ---------------------------
-async def init_db() -> None:
+# ---------------------------------------------------------------------
+async def init_db():
     """
-    Создаёт БД при её отсутствии, затем таблицы, регистрирует аудит
-    и гарантирует дефолтные настройки видимости меню.
+    Инициализация схемы без Alembic:
+    - Создаём БД (если нет)
+    - Создаём таблицы/ENUM-типы из ORM
+    - Применяем SQL-патчи (ALTER/ADD VALUE и т.п.)
+    - Регистрируем аудит-слушатели
     """
-    # 1) Если базы нет после DROP DATABASE — создадим её
+    # 1) убедиться, что база существует
     await ensure_database_exists()
 
-    # 2) Создадим таблицы
+    # 2) создать таблицы/типы по моделям
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
 
-    # 3) Аудит (после create_all, чтобы таблица audit_logs точно была)
-    register_audit_listeners()
+    # 3) применить SQL-патчи (если есть)
+    await apply_sql_patches()
 
-    # 4) Дефолтные настройки видимости меню (безопасно вызывать повторно)
-    async with get_session() as session:
-        await ensure_menu_visibility_defaults(session)
+    # 4) подписать аудит
+    register_audit_listeners()
 
 
 @asynccontextmanager
@@ -190,13 +250,13 @@ async def ensure_core_data() -> None:
             await session.commit()
 
 
-# ---------------------------
-# Stock helpers (важно: supplies.status — VARCHAR)
-# ---------------------------
+# ---------------------------------------------------------------------
+# Stock helpers (ENUM-безопасно)
+# ---------------------------------------------------------------------
 async def available_packed(session: AsyncSession, warehouse_id: int, product_id: int) -> int:
     """
     Доступный PACKED = фактический PACKED - сумма qty в активных поставках
-    (status in 'assembling'|'assembled'|'in_transit') по этому складу/товару.
+    (status in assembling|assembled|in_transit) по этому складу/товару.
     """
     fact = await session.scalar(
         select(func.coalesce(func.sum(StockMovement.qty), 0))
@@ -207,8 +267,7 @@ async def available_packed(session: AsyncSession, warehouse_id: int, product_id:
             )
     )
 
-    # колонка supplies.status у вас VARCHAR → сравниваем со строками
-    active_status = ("assembling", "assembled", "in_transit")
+    active_status = (SupplyStatus.assembling, SupplyStatus.assembled, SupplyStatus.in_transit)
     reserved = await session.scalar(
         select(func.coalesce(func.sum(SupplyItem.qty), 0))
         .join(Supply, Supply.id == SupplyItem.supply_id)
@@ -221,9 +280,9 @@ async def available_packed(session: AsyncSession, warehouse_id: int, product_id:
     return int((fact or 0) - (reserved or 0))
 
 
-# ---------------------------
+# ---------------------------------------------------------------------
 # Audit helpers (JSON-safe)
-# ---------------------------
+# ---------------------------------------------------------------------
 def _to_plain(value):
     """Рекурсивно приводит к JSON-совместимым типам (enum -> .value, даты -> ISO, Decimal -> float и т.п.)."""
     if isinstance(value, enum.Enum):
