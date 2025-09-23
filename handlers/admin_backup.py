@@ -4,29 +4,29 @@ from __future__ import annotations
 import asyncio
 import html
 import os
+import re
 import shutil
 import tempfile
-import time
-from typing import Union, Tuple
+from typing import Union
 
 from aiogram import Router, F
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import StatesGroup, State
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    ContentType,
     FSInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
 )
 from sqlalchemy import select, text
 from sqlalchemy.engine.url import make_url
 
-from config import ADMIN_TELEGRAM_ID, TIMEZONE, DB_URL, YADISK_DIR
-from database.db import get_session, init_db, reset_db_engine, ping_db
+from config import ADMIN_TELEGRAM_ID, TIMEZONE, YADISK_DIR, DB_URL
+
+from database.db import get_session, reset_db_engine, ping_db
 from database.models import BackupSettings, BackupFrequency
 from scheduler.backup_scheduler import reschedule_backup
 from utils.backup import run_backup, build_restore_cmd
@@ -34,13 +34,13 @@ from utils.backup import run_backup, build_restore_cmd
 router = Router()
 
 
-# ===== FSM states =====
+# ===== FSM =====
 class BackupState(StatesGroup):
+    waiting_schedule = State()
     waiting_time = State()
     waiting_retention = State()
     waiting_restore_file = State()
     waiting_restore_confirm = State()
-    # Wipe DB
     waiting_wipe_phrase = State()
     waiting_wipe_dbname = State()
 
@@ -48,29 +48,20 @@ class BackupState(StatesGroup):
 # ===== helpers =====
 async def _load_settings() -> BackupSettings | None:
     async with get_session() as s:
-        return (await s.execute(select(BackupSettings).where(BackupSettings.id == 1))).scalar_one_or_none()
+        r = await s.execute(select(BackupSettings).limit(1))
+        return r.scalar_one_or_none()
 
 
 async def _ensure_settings_exists(msg_or_cb: Union[Message, CallbackQuery]) -> BackupSettings | None:
-    """
-    Гарантируем, что backup_settings (id=1) существует.
-    Если таблицы нет (после wipe) — создаём схему через init_db() и вставляем запись.
-    """
-    st = None
-    try:
-        st = await _load_settings()
-    except Exception:
-        st = None
-
+    st = await _load_settings()
     if not st:
         try:
-            await init_db()
             async with get_session() as s:
-                st = await s.get(BackupSettings, 1)
+                r = await s.execute(select(BackupSettings).limit(1))
+                st = r.scalar_one_or_none()
                 if not st:
                     st = BackupSettings(
-                        id=1,
-                        enabled=False,
+                        enabled=True,
                         frequency=BackupFrequency.daily,
                         time_hour=3,
                         time_minute=30,
@@ -80,7 +71,6 @@ async def _ensure_settings_exists(msg_or_cb: Union[Message, CallbackQuery]) -> B
                     await s.commit()
         except Exception:
             st = None
-
     if not st:
         out = msg_or_cb.message if isinstance(msg_or_cb, CallbackQuery) else msg_or_cb
         await out.answer("⚠️ БД ещё не готова. Попробуйте позже.")
@@ -92,7 +82,6 @@ def _kb_main(st: BackupSettings) -> InlineKeyboardMarkup:
     onoff = "🟢 Включено" if st.enabled else "🔴 Выключено"
     freq_map = {"daily": "Ежедневно", "weekly": "Еженедельно", "monthly": "Ежемесячно"}
     freq_title = freq_map.get(st.frequency.value, st.frequency.value)
-
     rows = [
         [InlineKeyboardButton(text=f"{onoff} — переключить", callback_data="bk:toggle")],
         [
@@ -128,7 +117,7 @@ async def _render(target: Union[CallbackQuery, Message], st: BackupSettings) -> 
 
 
 async def _auto_back_to_menu(target: Union[CallbackQuery, Message]) -> None:
-    """Через 2 секунды вернёмся на экран бэкапов."""
+    """Через 2 секунды перерисуем экран бэкапов."""
     await asyncio.sleep(2)
     st = await _load_settings()
     if not st:
@@ -182,93 +171,61 @@ async def bk_toggle(cb: CallbackQuery, state: FSMContext):
     await cb.answer("Сохранено.")
 
 
-# ===== schedule (частота + время) =====
-def _kb_schedule_time(st: BackupSettings) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="Ежедневно", callback_data="bk:f:daily"),
-                InlineKeyboardButton(text="Еженедельно", callback_data="bk:f:weekly"),
-                InlineKeyboardButton(text="Ежемесячно", callback_data="bk:f:monthly"),
-            ],
-            [InlineKeyboardButton(text=f"🕒 Время: {st.time_hour:02d}:{st.time_minute:02d}", callback_data="bk:time")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:backup")],
-        ]
-    )
+# ===== schedule =====
+def _kb_schedule() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📅 Ежедневно", callback_data="bk:sch:daily")],
+        [InlineKeyboardButton(text="🗓 Еженедельно", callback_data="bk:sch:weekly")],
+        [InlineKeyboardButton(text="📆 Ежемесячно", callback_data="bk:sch:monthly")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:backup")],
+    ])
 
 
 @router.callback_query(F.data == "bk:schedule")
 async def bk_schedule(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_TELEGRAM_ID:
         return
-    st = await _ensure_settings_exists(cb)
-    if not st:
-        await cb.answer()
-        return
-    await cb.message.edit_text("Настройка расписания:", reply_markup=_kb_schedule_time(st))
+    await state.set_state(BackupState.waiting_schedule)
+    await cb.message.edit_text("Выберите периодичность:", reply_markup=_kb_schedule())
     await cb.answer()
 
 
-@router.callback_query(F.data.startswith("bk:f:"))
-async def bk_set_freq(cb: CallbackQuery, state: FSMContext):
+@router.callback_query(F.data.startswith("bk:sch:"), BackupState.waiting_schedule)
+async def bk_schedule_pick(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_TELEGRAM_ID:
         return
-    st = await _ensure_settings_exists(cb)
-    if not st:
-        await cb.answer()
+    _, _, freq = cb.data.partition("bk:sch:")
+    if freq not in {"daily", "weekly", "monthly"}:
+        await cb.answer("Неизвестно.")
         return
-
-    freq = cb.data.split(":")[-1]
-    if freq not in ("daily", "weekly", "monthly"):
-        await cb.answer("Неверное значение частоты.")
-        return
-
-    async with get_session() as s:
-        st.frequency = {
-            "daily": BackupFrequency.daily,
-            "weekly": BackupFrequency.weekly,
-            "monthly": BackupFrequency.monthly,
-        }[freq]
-        s.add(st)
-        await s.commit()
-
-    await reschedule_backup(cb.bot.scheduler, TIMEZONE, cb.bot.db_url)
-    st = await _load_settings()
-    await cb.message.edit_text("Настройка расписания:", reply_markup=_kb_schedule_time(st))
-    await cb.answer("Частота сохранена.")
-
-
-@router.callback_query(F.data == "bk:time")
-async def bk_time(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != ADMIN_TELEGRAM_ID:
-        return
+    await state.update_data(freq=freq)
     await state.set_state(BackupState.waiting_time)
-    await cb.message.edit_text(
-        "Введите время в формате <b>HH:MM</b> (24ч), например <code>03:15</code>.",
-        parse_mode="HTML",
-    )
+    await cb.message.edit_text("Укажите время (HH:MM). Пример: 03:15")
     await cb.answer()
 
 
 @router.message(BackupState.waiting_time)
-async def bk_time_set(msg: Message, state: FSMContext):
+async def bk_schedule_time(msg: Message, state: FSMContext):
     if msg.from_user.id != ADMIN_TELEGRAM_ID:
         return
-    t = (msg.text or "").strip()
-    try:
-        hh_str, mm_str = t.split(":")
-        hh = int(hh_str)
-        mm = int(mm_str)
-        assert 0 <= hh <= 23 and 0 <= mm <= 59
-    except Exception:
-        await msg.answer("Неверный формат. Пример: 03:15")
+    m = re.fullmatch(r"\s*(\d{1,2}):(\d{2})\s*", (msg.text or ""))
+    if not m:
+        await msg.answer("Формат времени HH:MM, пример: 03:15")
         return
+    hh, mm = int(m.group(1)), int(m.group(2))
+    if not (0 <= hh <= 23 and 0 <= mm <= 59):
+        await msg.answer("Часы 0..23, минуты 0..59. Пример: 03:15")
+        return
+
+    data = await state.get_data()
+    freq = data.get("freq") or "daily"
 
     st = await _ensure_settings_exists(msg)
     if not st:
         return
 
     async with get_session() as s:
+        st.frequency = BackupFrequency(freq)
         st.time_hour = hh
         st.time_minute = mm
         s.add(st)
@@ -276,9 +233,8 @@ async def bk_time_set(msg: Message, state: FSMContext):
 
     await reschedule_backup(msg.bot.scheduler, TIMEZONE, msg.bot.db_url)
     await state.clear()
-
     st = await _load_settings()
-    await msg.answer("Время сохранено.")
+    await msg.answer("Расписание сохранено.")
     await _render(msg, st)
 
 
@@ -365,7 +321,7 @@ async def bk_restore_open(cb: CallbackQuery, state: FSMContext):
         await cb.answer()
         await _auto_back_to_menu(cb)
         return
-    await _ensure_settings_exists(cb)  # не критично, но подтянем настройки
+    await _ensure_settings_exists(cb)
     await _restore_open_common(cb, state)
 
 
@@ -496,7 +452,10 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
 
     except Exception as e:
         try:
-            await msg.answer(f"<b>Ошибка запуска восстановления</b>:\n<pre>{html.escape(repr(e))}</pre>", parse_mode="HTML")
+            await msg.answer(
+                f"<b>Ошибка запуска восстановления</b>:\n<pre>{html.escape(repr(e))}</pre>",
+                parse_mode="HTML",
+            )
         except TelegramBadRequest:
             await msg.answer(f"Ошибка запуска восстановления: {repr(e)}")
     finally:
