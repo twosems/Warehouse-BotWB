@@ -1,6 +1,5 @@
 # utils/backup.py
 from __future__ import annotations
-
 import os
 import sys
 import time
@@ -8,40 +7,22 @@ import shlex
 import shutil
 import subprocess
 import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Tuple, List
-
-import requests
-from xml.etree import ElementTree as ET
-from email.utils import parsedate_to_datetime
-
+from typing import Tuple
 from sqlalchemy import select
 from sqlalchemy.engine.url import make_url
-
 from database.db import get_session
 from database.models import BackupSettings
-
-# --- Google Drive (оставляем для совместимости; не используется при BACKUP_DRIVER=webdav)
-from utils.gdrive_oauth import build_drive_oauth, upload_file, cleanup_old  # type: ignore
-try:
-    from utils.gdrive import build_drive as build_drive_sa  # type: ignore
-except Exception:
-    build_drive_sa = None  # noqa: F401
-
 from config import (
     PG_DUMP_PATH,
-    GOOGLE_AUTH_MODE,             # 'oauth' | 'sa' (для совместимости)
-    GOOGLE_OAUTH_CLIENT_PATH,     # client_secret.json
-    GOOGLE_OAUTH_TOKEN_PATH,      # token.json
-
-    # --- новый блок для WebDAV / выбора драйвера ---
-    BACKUP_DRIVER,                # "webdav" | "oauth" | "sa"
-    WEBDAV_BASE_URL,              # напр. https://webdav.yandex.ru
-    WEBDAV_USERNAME,              # логин/почта Яндекс
-    WEBDAV_PASSWORD,              # пароль или пароль приложения
-    WEBDAV_ROOT,                  # удалённая папка, напр. /botwb
+    BACKUP_DRIVER,    # ожидаем "yadisk" (по умолчанию)
+    BACKUP_DIR,       # локальная папка (если используешь)
+    YADISK_TOKEN,
+    YADISK_DIR,
+    BACKUP_KEEP,
 )
+from utils.yadisk_client import YaDisk, YaDiskError
 
 
 # ------------------------- PG utils -------------------------
@@ -65,10 +46,7 @@ def _human_mb(path: str) -> float:
 
 
 def _resolve_pg_dump() -> str | None:
-    """
-    Ищем pg_dump в PATH; если нет — берём PG_DUMP_PATH, если он указывает на реально существующий файл.
-    Так мы игнорируем «виндовые» пути, случайно попавшие в окружение.
-    """
+    """ Ищем pg_dump в PATH; если нет — используем PG_DUMP_PATH, если он указывает на реальный файл. """
     found = shutil.which("pg_dump")
     if found:
         return found
@@ -79,159 +57,21 @@ def _resolve_pg_dump() -> str | None:
     return None
 
 
-# ------------------------- WebDAV client -------------------------
-
-class WebDAVClient:
-    def __init__(self, base_url: str, username: str, password: str):
-        self.base = base_url.rstrip("/")
-        self.session = requests.Session()
-        self.session.auth = (username, password)
-
-    def _url(self, path: str) -> str:
-        return f"{self.base}/{path.lstrip('/')}"
-
-    def mkcol_recursive(self, remote_dir: str) -> None:
-        parts = [p for p in remote_dir.strip("/").split("/") if p]
-        cur = ""
-        for seg in parts:
-            cur = f"{cur}/{seg}"
-            url = self._url(cur)
-            r = self.session.request("MKCOL", url)
-            # 201 — создано, 405 — уже существует, 409 — родителя нет (создадим на следующей итерации)
-            if r.status_code in (201, 405, 409):
-                continue
-
-    def put_file(self, local_path: str, remote_path: str) -> None:
-        url = self._url(remote_path)
-        with open(local_path, "rb") as f:
-            r = self.session.put(url, data=f)
-        if r.status_code not in (200, 201, 204):
-            raise RuntimeError(f"WebDAV PUT failed ({r.status_code}): {r.text[:400]}")
-
-    def list_dir(self, remote_dir: str) -> List[dict]:
-        """
-        Список элементов каталога (1 уровень).
-        Возвращает словари: {"href","name","is_dir","modified"(datetime|None)}.
-        """
-        url = self._url(remote_dir)
-        headers = {"Depth": "1", "Content-Type": "text/xml; charset=utf-8"}
-        body = """<?xml version="1.0" encoding="utf-8" ?>
-<d:propfind xmlns:d="DAV:">
-  <d:prop>
-    <d:displayname />
-    <d:getlastmodified />
-    <d:resourcetype />
-  </d:prop>
-</d:propfind>"""
-        r = self.session.request("PROPFIND", url, data=body.encode("utf-8"), headers=headers)
-        if r.status_code != 207:
-            raise RuntimeError(f"WebDAV PROPFIND failed ({r.status_code}): {r.text[:400]}")
-
-        out: List[dict] = []
-        ns = {"d": "DAV:"}
-        root = ET.fromstring(r.text)
-        for resp in root.findall("d:response", ns):
-            href_el = resp.find("d:href", ns)
-            if href_el is None:
-                continue
-            href = href_el.text or ""
-            prop = resp.find("d:propstat/d:prop", ns)
-            if prop is None:
-                continue
-            name_el = prop.find("d:displayname", ns)
-            name = name_el.text if name_el is not None else ""
-            rtype = prop.find("d:resourcetype", ns)
-            is_dir = rtype is not None and rtype.find("d:collection", ns) is not None
-            mod_el = prop.find("d:getlastmodified", ns)
-            modified_dt = None
-            if mod_el is not None and mod_el.text:
-                try:
-                    modified_dt = parsedate_to_datetime(mod_el.text)
-                    if modified_dt.tzinfo is None:
-                        modified_dt = modified_dt.replace(tzinfo=timezone.utc)
-                except Exception:
-                    modified_dt = None
-
-            # пропускаем сам каталог
-            if href.rstrip("/").endswith(remote_dir.strip("/")):
-                continue
-
-            if not name:
-                name = href.rstrip("/").split("/")[-1]
-
-            out.append({"href": href, "name": name, "is_dir": is_dir, "modified": modified_dt})
-        return out
-
-    def delete(self, remote_path: str) -> None:
-        url = self._url(remote_path)
-        r = self.session.delete(url)
-        if r.status_code not in (200, 204):
-            raise RuntimeError(f"WebDAV DELETE failed ({r.status_code}): {r.text[:400]}")
-
-
-def _webdav_upload_and_cleanup(
-        local_path: str,
-        filename: str,
-        retention_days: int,
-        name_prefix: str,
-) -> Tuple[str, int]:
-    """
-    Заливает файл на WEBDAV_ROOT и удаляет старые с тем же префиксом имени.
-    Возвращает (remote_path, deleted_count).
-    """
-    if not WEBDAV_BASE_URL or not WEBDAV_USERNAME or not WEBDAV_PASSWORD:
-        raise RuntimeError("WebDAV not configured: WEBDAV_BASE_URL/WEBDAV_USERNAME/WEBDAV_PASSWORD are required")
-
-    client = WebDAVClient(WEBDAV_BASE_URL, WEBDAV_USERNAME, WEBDAV_PASSWORD)
-
-    remote_dir = WEBDAV_ROOT or "/"
-    client.mkcol_recursive(remote_dir)
-
-    remote_path = f"{remote_dir.rstrip('/')}/{filename}"
-    client.put_file(local_path, remote_path)
-
-    deleted = 0
-    if retention_days > 0:
-        try:
-            items = client.list_dir(remote_dir)
-            cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
-            for it in items:
-                if it.get("is_dir"):
-                    continue
-                nm = it.get("name") or ""
-                mod = it.get("modified")
-                if not nm.startswith(name_prefix):
-                    continue
-                if mod and mod < cutoff:
-                    href = it.get("href") or ""
-                    # href вида /botwb/filename.backup → берём относительный путь
-                    rel = "/" + href.lstrip("/").split("/", 1)[-1] if href.startswith("/") else href
-                    try:
-                        client.delete(rel)
-                        deleted += 1
-                    except Exception:
-                        continue
-        except Exception:
-            # Не считаем ошибку очистки фатальной для бэкапа
-            pass
-
-    return remote_path, deleted
-
-
 # ------------------------- Основной бэкап -------------------------
 
 async def run_backup(db_url: str) -> Tuple[bool, str]:
     """
-    Делает pg_dump и отправляет в хранилище по BACKUP_DRIVER:
-      - 'webdav' → Яндекс.Диск/любой WebDAV
-      - 'oauth'  → Google Drive (личный)
-      - 'sa'     → Google Drive (Service Account на Shared Drive)
+    Делает pg_dump и отправляет в Яндекс.Диск (REST).
+    BACKUP_DRIVER должен быть 'yadisk' (или пустой — мы приведём к 'yadisk').
     """
     # Охранный флаг: бэкап только на сервере
     if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
         return False, "Backups are disabled on non-server host (HOST_ROLE != server)"
 
-    # 1) Настройки
+    driver = (BACKUP_DRIVER or "yadisk").lower()
+    if driver != "yadisk":
+        return False, f"Unsupported BACKUP_DRIVER='{driver}'. Only 'yadisk' is supported in this build."
+
     async with get_session() as s:
         st = (await s.execute(select(BackupSettings).where(BackupSettings.id == 1))).scalar_one_or_none()
         if not st:
@@ -243,7 +83,6 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
         ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
         fname = f"{params['database']}_{ts}.backup"
 
-        # 2) Дамп во временный файл
         with tempfile.TemporaryDirectory() as tmpdir:
             fpath = os.path.join(tmpdir, fname)
 
@@ -253,7 +92,7 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
 
             pg_dump_bin = _resolve_pg_dump()
             if not pg_dump_bin:
-                return False, "pg_dump not found on PATH and PG_DUMP_PATH is invalid"
+                return False, "pg_dump not found (PATH/PG_DUMP_PATH)"
 
             cmd = [
                 pg_dump_bin,
@@ -281,53 +120,28 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
             duration = round(time.monotonic() - t0, 2)
             size_mb = _human_mb(fpath)
 
-            # 3) Загрузка по драйверу
-            driver = (BACKUP_DRIVER or "oauth").lower()
+            # Загрузка на Я.Диск + ротация
             try:
-                if driver == "webdav":
-                    remote_path, deleted = _webdav_upload_and_cleanup(
-                        fpath,
-                        fname,
-                        st.retention_days,
-                        name_prefix=params["database"],
-                    )
-                    msg = (f"OK: {fname} uploaded to WebDAV ({remote_path}), "
-                           f"size={size_mb:.2f} MB, duration={duration}s, deleted {deleted} old")
+                yd = YaDisk(YADISK_TOKEN)
+                yd.ensure_tree(YADISK_DIR)
+                remote_path = yd.upload_file(fpath, YADISK_DIR)
 
-                elif driver == "sa":
-                    if not build_drive_sa:
-                        return False, "Service Account mode requested but utils.gdrive is missing"
-                    if not st.gdrive_sa_json:
-                        return False, "Service Account JSON is not configured in backup_settings"
-                    drive = build_drive_sa(st.gdrive_sa_json)
-                    if not st.gdrive_folder_id:
-                        return False, "Google Drive not configured: Folder ID is empty"
-                    file_id = upload_file(drive, fpath, fname, st.gdrive_folder_id)
-                    try:
-                        deleted = cleanup_old(drive, st.gdrive_folder_id, st.retention_days, name_prefix=params["database"])
-                        msg = (f"OK: {fname} uploaded (id={file_id}), "
-                               f"size={size_mb:.2f} MB, duration={duration}s, deleted {deleted} old")
-                    except Exception as e:
-                        msg = (f"OK: {fname} uploaded (id={file_id}), "
-                               f"size={size_mb:.2f} MB, duration={duration}s; cleanup failed: {e}")
+                deleted = []
+                if BACKUP_KEEP and BACKUP_KEEP > 0:
+                    items = yd.list(YADISK_DIR, limit=1000)
+                    files = [x for x in items if x.get("type") == "file"]
+                    # сортируем по имени (…_YYYYmmdd_HHMMSS.backup) — гарантированно детерминированно
+                    files = sorted(files, key=lambda x: x.get("name", ""), reverse=True)
+                    if len(files) > BACKUP_KEEP:
+                        for old in files[BACKUP_KEEP:]:
+                            yd.delete(old["path"], permanently=True)
+                            deleted.append(old["name"])
 
-                else:
-                    # 'oauth'
-                    if not st.gdrive_folder_id:
-                        return False, "Google Drive not configured: Folder ID is empty"
-                    drive = build_drive_oauth(GOOGLE_OAUTH_CLIENT_PATH, GOOGLE_OAUTH_TOKEN_PATH)
-                    file_id = upload_file(drive, fpath, fname, st.gdrive_folder_id)
-                    try:
-                        deleted = cleanup_old(drive, st.gdrive_folder_id, st.retention_days, name_prefix=params["database"])
-                        msg = (f"OK: {fname} uploaded (id={file_id}), "
-                               f"size={size_mb:.2f} MB, duration={duration}s, deleted {deleted} old")
-                    except Exception as e:
-                        msg = (f"OK: {fname} uploaded (id={file_id}), "
-                               f"size={size_mb:.2f} MB, duration={duration}s; cleanup failed: {e}")
+                msg = (f"OK: {fname} uploaded to Yandex.Disk ({remote_path}), "
+                       f"size={size_mb:.2f} MB, duration={duration}s, deleted {len(deleted)} old")
             except Exception as e:
-                return False, f"Upload failed ({driver}): {e}"
+                return False, f"Upload failed (yadisk): {e}"
 
-        # 4) Сохраняем статус
         st.last_run_at = datetime.utcnow()
         st.last_status = msg[:500]
         await s.commit()
@@ -335,15 +149,12 @@ async def run_backup(db_url: str) -> Tuple[bool, str]:
     return True, msg
 
 
-# -------------------- Restore command builder (server-only) --------------------
+# -------------------- Restore command builder --------------------
 
 def build_restore_cmd(filepath: str) -> str:
-    """
-    Собирает команду восстановления строго для сервера через системный скрипт.
-    """
-    # Разрешаем restore только на сервере
+    """ Собирает команду восстановления (только на сервере, через внешний скрипт). """
     if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
-        raise RuntimeError("Restore доступен только на сервере (HOST_ROLE != server)")
+        raise RuntimeError("Restore доступен только на сервере")
 
     if sys.platform.startswith("win"):
         raise RuntimeError("Restore недоступен на Windows")
@@ -355,7 +166,7 @@ def build_restore_cmd(filepath: str) -> str:
     return f"sudo -n {shlex.quote(restore_path)} {shlex.quote(filepath)}"
 
 
-# --- Backward compatibility aliases -----------------------------------------
+# --- Алиасы для совместимости -----------------------------------
 
 async def make_backup_and_maybe_upload(db_url: str):
     return await run_backup(db_url)

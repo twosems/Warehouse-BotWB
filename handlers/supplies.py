@@ -314,7 +314,8 @@ async def supplies_root(call: types.CallbackQuery, user: User):
 async def sup_list(call: types.CallbackQuery, user: User):
     _, _, tab, page_s = call.data.split(":")
     if tab == "auto":
-        tab = "draft" if user.role in (UserRole.admin, UserRole.manager) else "queued"
+        tab = (SupplyStatus.draft.value if user.role in (UserRole.admin, UserRole.manager)
+              else SupplyStatus.queued.value)
     page = int(page_s)
     s_list, has_next = await _load_supplies(tab, user, page)
     await call.message.edit_text(f"Поставки — {tab}", reply_markup=_kb_sup_list(tab, s_list, page, has_next))

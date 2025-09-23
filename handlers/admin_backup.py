@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import html
-import json
 import os
 import shutil
 import tempfile
@@ -26,14 +25,7 @@ from aiogram.types import (
 from sqlalchemy import select, text
 from sqlalchemy.engine.url import make_url
 
-import httpx  # pip install httpx
-
-from config import (
-    ADMIN_TELEGRAM_ID,
-    TIMEZONE,
-    DB_URL,
-)
-
+from config import ADMIN_TELEGRAM_ID, TIMEZONE, DB_URL, YADISK_DIR
 from database.db import get_session, init_db, reset_db_engine, ping_db
 from database.models import BackupSettings, BackupFrequency
 from scheduler.backup_scheduler import reschedule_backup
@@ -41,27 +33,13 @@ from utils.backup import run_backup, build_restore_cmd
 
 router = Router()
 
-# --------- Константы путей и сервиса ---------
-GOOGLE_TOKEN_PATH = os.environ.get("GOOGLE_OAUTH_TOKEN_PATH", "/etc/botwb/google/token.json")
-GOOGLE_CLIENT_PATH = os.environ.get("GOOGLE_OAUTH_CLIENT_PATH", "/etc/botwb/google/client_secret_tv.json")
-SERVICE_NAME = "warehouse-botwb.service"
-
-# --------- OAuth Device Flow эндпоинты/скоуп ---------
-OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.file"
-DEVICE_CODE_URL = "https://oauth2.googleapis.com/device/code"
-TOKEN_URL = "https://oauth2.googleapis.com/token"
-
 
 # ===== FSM states =====
 class BackupState(StatesGroup):
-    waiting_folder_id = State()
     waiting_time = State()
     waiting_retention = State()
     waiting_restore_file = State()
     waiting_restore_confirm = State()
-    # OAuth/Token
-    waiting_oauth_poll = State()      # ожидание подтверждения на сайте Google
-    waiting_token_upload = State()    # ожидание загрузки token.json
     # Wipe DB
     waiting_wipe_phrase = State()
     waiting_wipe_dbname = State()
@@ -105,7 +83,7 @@ async def _ensure_settings_exists(msg_or_cb: Union[Message, CallbackQuery]) -> B
 
     if not st:
         out = msg_or_cb.message if isinstance(msg_or_cb, CallbackQuery) else msg_or_cb
-        await out.answer("⚠️ БД ещё не готова. Попробуйте позже или используйте Emergency Restore.")
+        await out.answer("⚠️ БД ещё не готова. Попробуйте позже.")
         return None
     return st
 
@@ -123,14 +101,10 @@ def _kb_main(st: BackupSettings) -> InlineKeyboardMarkup:
                 callback_data="bk:schedule",
             )
         ],
-        [InlineKeyboardButton(text=f"🧹 Retention: {st.retention_days} дн.", callback_data="bk:retention")],
-        [InlineKeyboardButton(text=f"📁 Folder ID: {st.gdrive_folder_id or '—'}", callback_data="bk:folder")],
-        [InlineKeyboardButton(text="🔗 Подключить Google (OAuth)", callback_data="bk:oauth")],
-        [InlineKeyboardButton(text="⬆️ Загрузить token.json", callback_data="bk:token_upload")],
+        [InlineKeyboardButton(text=f"🧹 Хранить (дней): {st.retention_days}", callback_data="bk:retention")],
         [InlineKeyboardButton(text="🧪 Сделать бэкап сейчас", callback_data="bk:run")],
         [InlineKeyboardButton(text="♻️ Восстановить БД", callback_data="bk:restore")],
         [InlineKeyboardButton(text="🧨 Очистить базу", callback_data="bk:wipe")],
-        [InlineKeyboardButton(text="🆘 Emergency Restore", callback_data="bk:restore_emergency")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="admin:root")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -138,12 +112,11 @@ def _kb_main(st: BackupSettings) -> InlineKeyboardMarkup:
 
 async def _render(target: Union[CallbackQuery, Message], st: BackupSettings) -> None:
     text = (
-        "<b>Бэкапы БД → Google Drive</b>\n\n"
+        "<b>Бэкапы БД → Яндекс.Диск</b>\n\n"
         f"Статус: {'🟢 Включено' if st.enabled else '🔴 Выключено'}\n"
         f"Расписание: <code>{st.frequency.value}</code> @ {st.time_hour:02d}:{st.time_minute:02d} ({TIMEZONE})\n"
         f"Retention: {st.retention_days} дней\n"
-        f"Folder ID: <code>{st.gdrive_folder_id or '—'}</code>\n"
-        "Авторизация: <b>OAuth</b> (client_secret.json + token.json, пути берутся из .env)\n"
+        f"Папка на Я.Диске: <code>{html.escape(YADISK_DIR or '—')}</code>\n"
         f"Последний запуск: {st.last_run_at.strftime('%Y-%m-%d %H:%M:%S') if st.last_run_at else '—'}\n"
         f"Статус последнего: {st.last_status or '—'}"
     )
@@ -161,42 +134,6 @@ async def _auto_back_to_menu(target: Union[CallbackQuery, Message]) -> None:
     if not st:
         return
     await _render(target, st)
-
-
-async def _restart_service() -> Tuple[bool, str]:
-    try:
-        proc = await asyncio.create_subprocess_shell(
-            f"sudo systemctl restart {SERVICE_NAME}",
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        out, _ = await proc.communicate()
-        ok = proc.returncode == 0
-        msg = (out or b"").decode(errors="ignore")
-        return ok, msg
-    except Exception as e:
-        return False, repr(e)
-
-
-async def _save_token_json(raw_json: str) -> None:
-    os.makedirs(os.path.dirname(GOOGLE_TOKEN_PATH), exist_ok=True)
-    with open(GOOGLE_TOKEN_PATH, "w", encoding="utf-8") as f:
-        f.write(raw_json)
-    # права/владелец — best-effort
-    try:
-        uid = __import__("pwd").getpwnam("malinabotwh").pw_uid
-        gid = __import__("grp").getgrnam("malinabotwh").gr_gid
-        os.chown(GOOGLE_TOKEN_PATH, uid, gid)
-    except Exception:
-        pass
-    os.chmod(GOOGLE_TOKEN_PATH, 0o600)
-
-
-def _load_client_id_secret() -> tuple[str, str]:
-    with open(GOOGLE_CLIENT_PATH, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
-    data = cfg.get("installed") or cfg  # client_secret.json обычно под ключом "installed"
-    return data["client_id"], data["client_secret"]
 
 
 # ===== entry points =====
@@ -352,7 +289,7 @@ async def bk_retention(cb: CallbackQuery, state: FSMContext):
         return
     await state.set_state(BackupState.waiting_retention)
     await cb.message.edit_text(
-        "Сколько дней хранить бэкапы на Google Drive? Введите число, например <code>30</code>.",
+        "Сколько <b>дней</b> хранить бэкапы на Я.Диске? Введите число, например <code>30</code>.",
         parse_mode="HTML",
     )
     await cb.answer()
@@ -384,199 +321,6 @@ async def bk_retention_set(msg: Message, state: FSMContext):
     await _render(msg, st)
 
 
-# ===== Folder ID =====
-@router.callback_query(F.data == "bk:folder")
-async def bk_folder(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != ADMIN_TELEGRAM_ID:
-        return
-    await state.set_state(BackupState.waiting_folder_id)
-    await cb.message.edit_text(
-        "Пришлите <b>Folder ID</b> папки Google Drive, куда складывать бэкапы.\n"
-        "Пример: <code>1abcDEFghij...XYZ</code>",
-        parse_mode="HTML",
-    )
-    await cb.answer()
-
-
-@router.message(BackupState.waiting_folder_id)
-async def bk_folder_set(msg: Message, state: FSMContext):
-    if msg.from_user.id != ADMIN_TELEGRAM_ID:
-        return
-    folder_id = (msg.text or "").strip()
-    if not folder_id:
-        await msg.answer("Folder ID не должен быть пустым.")
-        return
-
-    st = await _ensure_settings_exists(msg)
-    if not st:
-        return
-
-    async with get_session() as s:
-        st.gdrive_folder_id = folder_id
-        s.add(st)
-        await s.commit()
-
-    await state.clear()
-    st = await _load_settings()
-    await msg.answer("Folder ID сохранён.")
-    await _render(msg, st)
-
-
-# ===== OAuth: Device Flow =====
-@router.callback_query(F.data == "bk:oauth")
-async def bk_oauth(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != ADMIN_TELEGRAM_ID:
-        return
-
-    # 1) читаем client_id/secret
-    try:
-        client_id, client_secret = _load_client_id_secret()
-    except Exception as e:
-        await cb.message.edit_text(
-            f"Не найден или неверный <code>{html.escape(GOOGLE_CLIENT_PATH)}</code>:\n"
-            f"<pre>{html.escape(repr(e))}</pre>",
-            parse_mode="HTML",
-        )
-        await cb.answer()
-        await _auto_back_to_menu(cb)
-        return
-
-    # 2) запрашиваем device_code
-    try:
-        async with httpx.AsyncClient(timeout=20) as cli:
-            r = await cli.post(DEVICE_CODE_URL, data={"client_id": client_id, "scope": OAUTH_SCOPE})
-            r.raise_for_status()
-            dev = r.json()
-    except Exception as e:
-        await cb.message.edit_text(f"Не удалось запросить device code:\n<pre>{html.escape(repr(e))}</pre>", parse_mode="HTML")
-        await cb.answer()
-        await _auto_back_to_menu(cb)
-        return
-
-    await state.update_data(
-        device_code=dev["device_code"],
-        interval=int(dev.get("interval", 5)),
-        client_id=client_id,
-        client_secret=client_secret,
-    )
-
-    text = (
-        "🔗 <b>Подключение Google OAuth</b>\n\n"
-        "1) Откройте ссылку подтверждения:\n"
-        f"<code>{dev['verification_url']}</code>\n"
-        "2) Вставьте этот код:\n"
-        f"<b><code>{dev['user_code']}</code></b>\n\n"
-        "После подтверждения подождите — бот сам заберёт токен и перезапустит сервис."
-    )
-    await cb.message.edit_text(text, parse_mode="HTML")
-    await cb.answer()
-
-    # 3) поллим токен
-    await state.set_state(BackupState.waiting_oauth_poll)
-    deadline = time.monotonic() + 600  # до 10 минут
-    while time.monotonic() < deadline:
-        await asyncio.sleep(int(dev.get("interval", 5)))
-        try:
-            async with httpx.AsyncClient(timeout=20) as cli:
-                tr = await cli.post(
-                    TOKEN_URL,
-                    data={
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "device_code": dev["device_code"],
-                        "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
-                    },
-                )
-            if tr.status_code == 200:
-                tok = tr.json()
-                token_json = json.dumps(
-                    {
-                        "token": tok.get("access_token"),
-                        "refresh_token": tok.get("refresh_token"),
-                        "token_uri": TOKEN_URL,
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "scopes": [OAUTH_SCOPE],
-                        "universe_domain": "googleapis.com",
-                    },
-                    ensure_ascii=False,
-                )
-                await _save_token_json(token_json)
-                ok, log = await _restart_service()
-                msg = "✅ Токен получен и сохранён. Сервис перезапущен." if ok else \
-                    f"✅ Токен получен, но рестарт не удался:\n<pre>{html.escape(log)}</pre>"
-                await cb.message.edit_text(msg, parse_mode="HTML")
-                await state.clear()
-                await _auto_back_to_menu(cb)
-                return
-            else:
-                # ошибки ожидания
-                try:
-                    err = tr.json().get("error")
-                except Exception:
-                    err = None
-                if err in ("authorization_pending", "slow_down"):
-                    continue
-                if err in ("access_denied", "expired_token"):
-                    await cb.message.edit_text(f"❌ Авторизация прервана: {err}")
-                    await state.clear()
-                    await _auto_back_to_menu(cb)
-                    return
-                await cb.message.edit_text(f"❌ Ошибка обмена токена:\n<pre>{html.escape(tr.text)}</pre>", parse_mode="HTML")
-                await state.clear()
-                await _auto_back_to_menu(cb)
-                return
-        except Exception:
-            # подождём и попробуем снова
-            continue
-
-    await cb.message.edit_text("⏳ Время ожидания истекло. Попробуйте ещё раз.")
-    await state.clear()
-    await _auto_back_to_menu(cb)
-
-
-# ===== Загрузка token.json файлом =====
-@router.callback_query(F.data == "bk:token_upload")
-async def bk_token_upload(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != ADMIN_TELEGRAM_ID:
-        return
-    await state.set_state(BackupState.waiting_token_upload)
-    await cb.message.edit_text("Пришлите <b>token.json</b> документом. Я сохраню его и перезапущу сервис.", parse_mode="HTML")
-    await cb.answer()
-
-
-@router.message(BackupState.waiting_token_upload, F.content_type == ContentType.DOCUMENT)
-async def bk_token_file(msg: Message, state: FSMContext):
-    if msg.from_user.id != ADMIN_TELEGRAM_ID:
-        return
-    if not (msg.document and msg.document.file_name and msg.document.file_name.lower().endswith(".json")):
-        await msg.answer("Это не .json. Пришлите файл token.json.")
-        return
-
-    tg_file = await msg.bot.get_file(msg.document.file_id)
-    content = await msg.bot.download_file(tg_file.file_path)
-    raw = content.read().decode("utf-8", errors="ignore")
-
-    # минимальная проверка структуры
-    try:
-        data = json.loads(raw)
-        assert "client_id" in data and "client_secret" in data
-        assert "refresh_token" in data or "token" in data
-    except Exception:
-        await msg.answer("Похоже, это не валидный token.json от Google OAuth.")
-        return
-
-    await _save_token_json(raw)
-    ok, log = await _restart_service()
-    await state.clear()
-    if ok:
-        await msg.answer("✅ Токен загружен и сохранён. Сервис перезапущен.")
-    else:
-        safe = html.escape(log)
-        await msg.answer(f"✅ Токен сохранён, но рестарт не удался:\n<pre>{safe}</pre>", parse_mode="HTML")
-    await _auto_back_to_menu(msg)
-
-
 # ===== Run backup now =====
 @router.callback_query(F.data == "bk:run")
 async def bk_run(cb: CallbackQuery):
@@ -600,8 +344,8 @@ async def _restore_open_common(target: Union[CallbackQuery, Message], state: FSM
     text = (
         "♻️ Восстановление БД\n\n"
         "Пришлите файл бэкапа <b>документом</b>.\n"
-        "Поддерживаемые форматы: <code>.backup</code>, <code>.backup.gz</code>, <code>.dump</code>, "
-        "<code>.sql</code>, <code>.sql.gz</code>\n"
+        "Поддерживаемые форматы: <code>.backup</code>, <code>.backup.gz</code>, "
+        "<code>.dump</code>, <code>.sql</code>, <code>.sql.gz</code>\n"
         "⚠️ ВНИМАНИЕ: действующая БД будет перезаписана."
     )
     if isinstance(target, CallbackQuery):
@@ -611,31 +355,17 @@ async def _restore_open_common(target: Union[CallbackQuery, Message], state: FSM
         await target.answer(text, parse_mode="HTML")
 
 
-# Обычный сценарий (через меню)
 @router.callback_query(F.data == "bk:restore")
 async def bk_restore_open(cb: CallbackQuery, state: FSMContext):
     if cb.from_user.id != ADMIN_TELEGRAM_ID:
         return
-    # Блокируем восстановление не на сервере
+    # Только на сервере
     if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
         await cb.message.edit_text("Восстановление разрешено только на сервере (HOST_ROLE != server).")
         await cb.answer()
         await _auto_back_to_menu(cb)
         return
     await _ensure_settings_exists(cb)  # не критично, но подтянем настройки
-    await _restore_open_common(cb, state)
-
-
-# Emergency Restore (без обращения к БД)
-@router.callback_query(F.data == "bk:restore_emergency")
-async def bk_restore_emergency(cb: CallbackQuery, state: FSMContext):
-    if cb.from_user.id != ADMIN_TELEGRAM_ID:
-        return
-    if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
-        await cb.message.edit_text("Восстановление разрешено только на сервере (HOST_ROLE != server).")
-        await cb.answer()
-        await _auto_back_to_menu(cb)
-        return
     await _restore_open_common(cb, state)
 
 
@@ -679,7 +409,7 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
         await msg.answer("Нужно написать ровно: Я ОТДАЮ СЕБЕ ОТЧЁТ")
         return
 
-    # Охранный флаг: только сервер
+    # Только сервер
     if os.environ.get("HOST_ROLE") and os.environ["HOST_ROLE"] != "server":
         await msg.answer("Восстановление разрешено только на сервере (HOST_ROLE != server).")
         await state.clear()
@@ -705,8 +435,6 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
     # --- /Preflight ---
 
     await msg.answer("Запускаю восстановление… Пришлю лог выполнения.")
-
-    # Команда: централизованная сборка (sudo -n $RESTORE_SCRIPT_PATH <file>)
     cmd = build_restore_cmd(filepath)
 
     # Пробрасываем PG-переменные из DB_URL (удобно для инструментов)
@@ -761,9 +489,8 @@ async def bk_restore_confirm(msg: Message, state: FSMContext):
                 await ping_db()
                 await msg.answer("✅ Пул подключений к БД пересоздан, соединение проверено.")
             except Exception as e:
-                err = html.escape(repr(e))
                 await msg.answer(
-                    f"⚠️ Бэкап восстановлен, но не удалось проверить соединение:\n<pre>{err}</pre>",
+                    f"⚠️ Бэкап восстановлен, но не удалось проверить соединение:\n<pre>{html.escape(repr(e))}</pre>",
                     parse_mode="HTML",
                 )
 
@@ -791,6 +518,7 @@ def _mask_db_url() -> tuple[str, str]:
         return safe, dbname
     except Exception:
         return "(не удалось разобрать DB_URL)", ""
+
 
 @router.callback_query(F.data == "bk:wipe")
 async def bk_wipe(cb: CallbackQuery, state: FSMContext):
