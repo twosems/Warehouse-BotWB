@@ -196,33 +196,50 @@ def _now():
 # ---------- Lists / Cards ----------
 async def _load_supplies(tab: str, user: User, page: int = 0):
     q = select(Supply).order_by(Supply.created_at.desc())
-    if tab == "draft":
-        q = q.where(Supply.status == SupplyStatus.draft)
-    elif tab == "queued":
-        q = q.where(Supply.status == SupplyStatus.queued)
-    elif tab == "assembling":
-        q = q.where(Supply.status == SupplyStatus.assembling)
-    elif tab == "assembled":
-        q = q.where(Supply.status == SupplyStatus.assembled)
-    elif tab == "in_transit":
-        q = q.where(Supply.status == SupplyStatus.in_transit)
+
+    # табы, которые напрямую соответствуют значениям Enum
+    status_tabs = {
+        SupplyStatus.draft.value,
+        SupplyStatus.queued.value,
+        SupplyStatus.assembling.value,
+        SupplyStatus.assembled.value,
+        SupplyStatus.in_transit.value,
+    }
+
+    if tab in status_tabs:
+        q = q.where(Supply.status == SupplyStatus(tab))
+
     elif tab == "arch":
-        q = q.where(Supply.status.in_([SupplyStatus.archived_delivered,
-                                       SupplyStatus.archived_returned,
-                                       SupplyStatus.cancelled]))
+        q = q.where(Supply.status.in_([
+            SupplyStatus.archived_delivered,
+            SupplyStatus.archived_returned,
+            SupplyStatus.cancelled,
+        ]))
+
     elif tab.startswith("my"):
         if tab == "myassembling":
-            q = q.where(Supply.status == SupplyStatus.assembling, Supply.assigned_picker_id == user.id)
+            q = q.where(
+                Supply.status == SupplyStatus.assembling,
+                Supply.assigned_picker_id == user.id
+            )
         elif tab == "myassembled":
-            q = q.where(Supply.status == SupplyStatus.assembled, Supply.assigned_picker_id == user.id)
+            q = q.where(
+                Supply.status == SupplyStatus.assembled,
+                Supply.assigned_picker_id == user.id
+            )
         else:  # myarch
-            q = q.where(Supply.assigned_picker_id == user.id,
-                        Supply.status.in_([SupplyStatus.archived_delivered, SupplyStatus.archived_returned]))
+            q = q.where(
+                Supply.assigned_picker_id == user.id,
+                Supply.status.in_([SupplyStatus.archived_delivered, SupplyStatus.archived_returned])
+            )
+
     async with get_session() as s:
         rows = (await s.execute(q.offset(page * PAGE).limit(PAGE + 1))).scalars().all()
+
     has_next = len(rows) > PAGE
     rows = rows[:PAGE]
     return rows, has_next
+
 
 
 def _kb_sup_list(tab: str, s_list: List[Supply], page: int, has_next: bool) -> InlineKeyboardMarkup:

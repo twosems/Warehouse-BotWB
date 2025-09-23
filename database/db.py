@@ -139,7 +139,7 @@ async def apply_sql_patches():
     - Папка: sql/patches
     - Имена файлов: 001_*.sql, 002_*.sql, ...
     - Хранит версию в таблице schema_version (max(version))
-    - Игнорирует пустые/комментные патчи; поддерживает несколько выражений через ';'
+    - Игнорирует пустые/комментные строки; исполняет скрипт целиком (поддержка DO $$ ... $$)
     """
     PATCHES_DIR.mkdir(parents=True, exist_ok=True)
     async with engine.begin() as conn:
@@ -164,29 +164,26 @@ async def apply_sql_patches():
 
             raw = p.read_text(encoding="utf-8")
 
-            # уберём пустые строки и комментарии '-- ...'
-            lines = []
+            # убираем пустые строки и строки-комментарии ('-- ...') — остальное оставляем как есть,
+            # чтобы не ломать DO $$ ... $$ и т.п.
+            cleaned_lines = []
             for ln in raw.splitlines():
                 s = ln.strip()
                 if not s or s.startswith("--"):
                     continue
-                lines.append(ln)
-            cleaned = "\n".join(lines).strip()
+                cleaned_lines.append(ln)
+            cleaned = "\n".join(cleaned_lines).strip()
 
-            # если после чистки не осталось SQL — всё равно фиксируем версию
             if cleaned:
-                # простое разбиение по ';' (для наших простых патчей ок)
-                for stmt in cleaned.split(";"):
-                    stmt = stmt.strip()
-                    if not stmt:
-                        continue
-                    await conn.execute(text(stmt))
+                # ВАЖНО: исполняем скрипт одной строкой, чтобы работали многооператорные блоки
+                await conn.exec_driver_sql(cleaned)
 
-            # записываем применённую версию даже если патч пустой
+            # фиксируем применённую версию (даже если скрипт был пустым после чистки)
             await conn.execute(
                 text("INSERT INTO schema_version(version) VALUES (:v)"),
                 {"v": v}
             )
+
 
 # ---------------------------------------------------------------------
 # Текущий пользователь для аудита (ставим из middleware/handler)
